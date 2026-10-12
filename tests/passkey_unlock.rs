@@ -745,6 +745,45 @@ async fn passkey_deletion_failure_rolls_back_credential_stamp_and_device_tokens(
 }
 
 #[tokio::test]
+async fn refresh_updates_device_activity_once_without_replaying_the_device_snapshot() {
+    let f = Fixture::with_policy(true, false).await;
+    let (request, key) = registration_with_key(&f.options().await, ORIGIN, true);
+    let credential = request["deviceResponse"]["rawId"].as_str().unwrap().to_owned();
+    assert_eq!(f.post("/api/webauthn", request).await.status(), StatusCode::OK);
+    let session = f.login_passkey(&credential, &key, &f.device).await;
+    f.sql("INSERT INTO web_authn_login_challenges (token_hash,state,created_at) VALUES ('activity-counter','synthetic',0);");
+    // Count database activity writes, not HTTP calls. This catches a second
+    // unguarded full-Device save in the refresh handler after authentication.
+    if f.postgres.is_some() {
+        f.sql("CREATE FUNCTION count_refresh_activity() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE web_authn_login_challenges SET created_at=created_at+1 WHERE token_hash='activity-counter'; RETURN NEW; END;$$; CREATE TRIGGER count_refresh_activity AFTER UPDATE OF updated_at ON devices FOR EACH ROW EXECUTE FUNCTION count_refresh_activity();");
+    } else {
+        f.sql("CREATE TRIGGER count_refresh_activity AFTER UPDATE OF updated_at ON devices BEGIN UPDATE web_authn_login_challenges SET created_at=created_at+1 WHERE token_hash='activity-counter'; END;");
+    }
+    let response = f
+        .client
+        .post(format!("{}/identity/connect/token", f.url))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "web"),
+            ("refresh_token", session["refresh_token"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(f.count("web_authn_login_challenges WHERE token_hash='activity-counter' AND created_at=1"), 1);
+    let refreshed: Value = response.json().await.unwrap();
+    let access = f
+        .client
+        .get(format!("{}/api/sync", f.url))
+        .bearer_auth(refreshed["access_token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(access.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn refresh_cannot_restore_a_token_revoked_during_its_activity_update() {
     let f = Fixture::with_policy(true, false).await;
     let (request, key) = registration_with_key(&f.options().await, ORIGIN, true);

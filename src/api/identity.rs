@@ -175,10 +175,9 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
                 format!("Unable to refresh login credentials: {}", err.message())
             )
         }
-        Ok((mut device, auth_tokens)) => {
-            // Save to update `device.updated_at` to track usage and toggle new status
-            device.save(true, conn).await?;
-
+        Ok((_, auth_tokens)) => {
+            // Device activity was already updated with a refresh-token guard.
+            // Saving that snapshot again could restore a concurrently revoked token.
             let result = json!({
                 "refresh_token": auth_tokens.refresh_token(),
                 "access_token": auth_tokens.access_token(),
