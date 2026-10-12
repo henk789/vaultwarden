@@ -272,6 +272,36 @@ impl Fixture {
         assert_eq!(r.status(), StatusCode::OK);
         r.json().await.unwrap()
     }
+    async fn login_passkey(
+        &self,
+        credential: &str,
+        key: &openssl::ec::EcKey<openssl::pkey::Private>,
+        device: &str,
+    ) -> Value {
+        let options: Value = self
+            .client
+            .get(format!("{}/identity/accounts/webauthn/assertion-options", self.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let response = native_assertion(&options, credential, key, &self.user, ORIGIN, true).to_string();
+        let form = [
+            ("grant_type", "webauthn"),
+            ("scope", "api offline_access"),
+            ("client_id", "web"),
+            ("token", options["token"].as_str().unwrap()),
+            ("deviceResponse", response.as_str()),
+            ("deviceIdentifier", device),
+            ("deviceName", "Synthetic browser"),
+            ("deviceType", "14"),
+        ];
+        let result = self.client.post(format!("{}/identity/connect/token", self.url)).form(&form).send().await.unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        result.json().await.unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -324,7 +354,7 @@ async fn passkey_enrollment_requires_step_up_and_never_adds_an_sso_bypass() {
 async fn passkey_disabled_preserves_existing_sync_and_list_and_denies_enrollment() {
     let f = Fixture::new(false).await;
     // The shared keypair endpoint retains its ordinary behavior with the new
-    // feature disabled, including first initialization and serial replacement.
+    // feature disabled: first initialization succeeds, replacement is rejected.
     f.sql(&format!("UPDATE users SET private_key=NULL,public_key=NULL WHERE uuid='{}'", f.user));
     for (i, private_key) in [&keys().original_account_private_key, &keys().repaired_private_key].iter().enumerate() {
         assert_eq!(
@@ -335,7 +365,11 @@ async fn passkey_disabled_preserves_existing_sync_and_list_and_denies_enrollment
             )
             .await
             .status(),
-            if i == 0 { StatusCode::OK } else { StatusCode::BAD_REQUEST }
+            if i == 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
         );
     }
 
@@ -602,6 +636,153 @@ async fn passkey_credentials_cannot_be_read_or_removed_by_another_account() {
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn passkey_deletion_revokes_every_session_but_preserves_other_passkeys_and_push_metadata() {
+    let f = Fixture::with_policy(true, false).await;
+    let mut registrations = Vec::new();
+    for _ in 0..2 {
+        let (request, key) = registration_with_key(&f.options().await, ORIGIN, true);
+        let credential = request["deviceResponse"]["rawId"].as_str().unwrap().to_owned();
+        let response = f.post("/api/webauthn", request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value = response.json().await.unwrap();
+        registrations.push((saved["id"].as_str().unwrap().to_owned(), credential, key));
+    }
+    let (_, credential, key) = &registrations[0];
+    let other_device = uuid::Uuid::new_v4().to_string();
+    let sessions =
+        [f.login_passkey(credential, key, &f.device).await, f.login_passkey(credential, key, &other_device).await];
+    f.sql("UPDATE devices SET twofactor_remember='synthetic-remember',push_token='synthetic-push'; UPDATE users SET stamp_exception='synthetic-exception',password_hint='preserved-hint';");
+    let id = &registrations[0].0;
+
+    // Idempotent deletion of a missing credential must not revoke any sessions.
+    let missing = uuid::Uuid::new_v4();
+    assert_eq!(
+        f.post(&format!("/api/webauthn/{missing}/delete"), json!({"masterPasswordHash":PASSWORD})).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(f.count("users WHERE security_stamp='synthetic-stamp'"), 1);
+    assert_eq!(f.count("devices WHERE twofactor_remember='synthetic-remember'"), 2);
+
+    assert_eq!(
+        f.post(&format!("/api/webauthn/{id}/delete"), json!({"masterPasswordHash":PASSWORD})).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(f.count("web_authn_credentials"), 1);
+    assert_eq!(f.count("users WHERE security_stamp='synthetic-stamp' OR stamp_exception IS NOT NULL"), 0);
+    assert_eq!(f.count("users WHERE akey='synthetic-key' AND private_key='synthetic-private-key' AND password_hint='preserved-hint'"), 1);
+    assert_eq!(f.count("devices WHERE twofactor_remember IS NOT NULL"), 0);
+    assert_eq!(f.count("devices WHERE push_token='synthetic-push'"), 2);
+    assert_eq!(f.count("(SELECT DISTINCT refresh_token FROM devices) AS distinct_tokens"), 2);
+    for session in sessions {
+        let access = f
+            .client
+            .get(format!("{}/api/sync", f.url))
+            .bearer_auth(session["access_token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(access.status(), StatusCode::UNAUTHORIZED);
+        let refresh = f
+            .client
+            .post(format!("{}/identity/connect/token", f.url))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", "web"),
+                ("refresh_token", session["refresh_token"].as_str().unwrap()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert!(!refresh.status().is_success());
+    }
+    // Revocation must not disable a different registered passkey or password fallback.
+    let (_, remaining_credential, remaining_key) = &registrations[1];
+    let session = f.login_passkey(remaining_credential, remaining_key, &f.device).await;
+    assert_eq!(session["UserDecryptionOptions"]["MasterPasswordUnlock"]["MasterKeyWrappedUserKey"], "synthetic-key");
+}
+
+#[tokio::test]
+async fn passkey_deletion_failure_rolls_back_credential_stamp_and_device_tokens() {
+    for stage in ["stamp", "device"] {
+        let f = Fixture::new(true).await;
+        let response = f.post("/api/webauthn", registration(&f.options().await, ORIGIN, true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value = response.json().await.unwrap();
+        let id = saved["id"].as_str().unwrap();
+        let other_device = uuid::Uuid::new_v4();
+        f.sql(&format!("UPDATE devices SET twofactor_remember='synthetic-remember'; INSERT INTO devices (uuid,user_uuid,created_at,updated_at,name,atype,refresh_token,twofactor_remember) VALUES ('{other_device}','{}',datetime('now'),datetime('now'),'Other browser',14,'other-refresh','synthetic-remember');", f.user));
+        let (table, column) = if stage == "stamp" {
+            ("users", "security_stamp")
+        } else {
+            ("devices", "refresh_token")
+        };
+        if f.postgres.is_some() {
+            f.sql(&format!("CREATE FUNCTION reject_revocation() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'synthetic revocation failure'; END;$$; CREATE TRIGGER reject_revocation AFTER UPDATE OF {column} ON {table} FOR EACH ROW EXECUTE FUNCTION reject_revocation();"));
+        } else {
+            f.sql(&format!("CREATE TRIGGER reject_revocation AFTER UPDATE OF {column} ON {table} BEGIN SELECT RAISE(ABORT,'synthetic revocation failure'); END;"));
+        }
+        let path = format!("/api/webauthn/{id}/delete");
+        assert!(!f.post(&path, json!({"masterPasswordHash":PASSWORD})).await.status().is_success());
+        assert_eq!(f.count("web_authn_credentials"), 1);
+        assert_eq!(f.count("users WHERE security_stamp='synthetic-stamp' AND akey='synthetic-key' AND private_key='synthetic-private-key'"), 1);
+        assert_eq!(f.count("devices WHERE refresh_token IN ('synthetic-refresh','other-refresh') AND twofactor_remember='synthetic-remember'"), 2);
+        assert_eq!(f.get("/api/webauthn").await["data"].as_array().unwrap().len(), 1);
+        if f.postgres.is_some() {
+            f.sql(&format!("DROP TRIGGER reject_revocation ON {table}; DROP FUNCTION reject_revocation();"));
+        } else {
+            f.sql("DROP TRIGGER reject_revocation;");
+        }
+        assert_eq!(f.post(&path, json!({"masterPasswordHash":PASSWORD})).await.status(), StatusCode::OK);
+        assert_eq!(f.count("web_authn_credentials"), 0);
+        assert_eq!(
+            f.count(
+                "devices WHERE refresh_token IN ('synthetic-refresh','other-refresh') OR twofactor_remember IS NOT NULL"
+            ),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_cannot_restore_a_token_revoked_during_its_activity_update() {
+    let f = Fixture::with_policy(true, false).await;
+    let (request, key) = registration_with_key(&f.options().await, ORIGIN, true);
+    let credential = request["deviceResponse"]["rawId"].as_str().unwrap().to_owned();
+    assert_eq!(f.post("/api/webauthn", request).await.status(), StatusCode::OK);
+    let session = f.login_passkey(&credential, &key, &f.device).await;
+    // Inject revocation exactly when refresh updates device activity. The
+    // callback must not issue an access token using the newly changed stamp,
+    // nor replay a full stale Device over the revoked refresh token.
+    if f.postgres.is_some() {
+        f.sql("CREATE FUNCTION revoke_during_refresh() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE users SET security_stamp='revoked-during-refresh' WHERE uuid=NEW.user_uuid; UPDATE devices SET refresh_token='revoked-during-refresh',twofactor_remember=NULL WHERE uuid=NEW.uuid AND user_uuid=NEW.user_uuid; RETURN NEW; END;$$; CREATE TRIGGER revoke_during_refresh AFTER UPDATE OF updated_at ON devices FOR EACH ROW EXECUTE FUNCTION revoke_during_refresh();");
+    } else {
+        f.sql("CREATE TRIGGER revoke_during_refresh AFTER UPDATE OF updated_at ON devices BEGIN UPDATE users SET security_stamp='revoked-during-refresh' WHERE uuid=NEW.user_uuid; UPDATE devices SET refresh_token='revoked-during-refresh',twofactor_remember=NULL WHERE uuid=NEW.uuid AND user_uuid=NEW.user_uuid; END;");
+    }
+    let response = f
+        .client
+        .post(format!("{}/identity/connect/token", f.url))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "web"),
+            ("refresh_token", session["refresh_token"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(f.count("devices WHERE refresh_token='revoked-during-refresh'"), 1);
+    assert_eq!(f.count("users WHERE security_stamp='revoked-during-refresh'"), 1);
+    let access = f
+        .client
+        .get(format!("{}/api/sync", f.url))
+        .bearer_auth(session["access_token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(access.status(), StatusCode::UNAUTHORIZED);
+}
+
 fn local_postgres_database() -> Option<(String, String)> {
     let Ok(value) = std::env::var("VW_PASSKEY_TEST_DATABASE_URL") else {
         return None;
@@ -739,23 +920,31 @@ impl Fixture {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
 async fn passkey_postgres_rotation_serializes_deletion_and_stale_rotation() {
-    for competing_action in ["delete", "rotate", "repair"] {
+    for competing_action in ["delete", "rotate"] {
         let f = Fixture::new(true).await;
         let (data, id) = f.paused_rotation_data().await;
         let mut pause = PausedRotation::new(&f);
         let first = f.start_rotation(&data);
         f.wait_for_paused_rotation().await;
+        // Upstream rejects replacing an initialized account keypair before any
+        // account lock is taken. Verify that refusal while rotation is paused;
+        // unlike deletion/rotation, this request must not wait for the lock.
+        let repair = f
+            .post(
+                "/api/accounts/keys",
+                json!({
+                    "publicKey": keys().repaired_public_key,
+                    "encryptedPrivateKey": keys().repaired_private_key,
+                }),
+            )
+            .await;
+        assert_eq!(repair.status(), StatusCode::BAD_REQUEST);
         let competing = if competing_action == "delete" {
             let request = f
                 .client
                 .post(format!("{}/api/webauthn/{id}/delete", f.url))
                 .bearer_auth(&f.token)
                 .json(&json!({"masterPasswordHash":PASSWORD}));
-            tokio::spawn(async move { request.send().await })
-        } else if competing_action == "repair" {
-            let request = f.client.post(format!("{}/api/accounts/keys", f.url)).bearer_auth(&f.token).json(
-                &json!({"publicKey":keys().repaired_public_key,"encryptedPrivateKey":keys().repaired_private_key}),
-            );
             tokio::spawn(async move { request.send().await })
         } else {
             f.start_rotation(&data)
@@ -767,14 +956,64 @@ async fn passkey_postgres_rotation_serializes_deletion_and_stale_rotation() {
         pause.release();
         assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
         let result = competing.await.unwrap().unwrap();
-        if competing_action == "delete" {
-            assert_eq!(result.status(), StatusCode::OK);
-        } else {
-            assert!(!result.status().is_success());
-        }
+        // Both operations authenticated against the pre-rotation account epoch.
+        // They must reject it, never overwrite newly rotated account keys.
+        assert_eq!(result.status(), StatusCode::BAD_REQUEST);
         assert_eq!(f.count("users WHERE akey='new-master-wrapper' AND private_key='new-account-private-wrapper'"), 1);
         assert_eq!(f.count("folders WHERE name='rotated-folder-wrapper'"), 1);
-        assert_eq!(f.count("web_authn_credentials"), i64::from(competing_action != "delete"));
+        assert_eq!(f.count("web_authn_credentials"), 1);
+    }
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
+async fn passkey_postgres_deletion_rechecks_account_after_password_disable_and_profile_changes() {
+    for change in ["password", "disable", "profile"] {
+        let f = Fixture::new(true).await;
+        let response = f.post("/api/webauthn", registration(&f.options().await, ORIGIN, true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value = response.json().await.unwrap();
+        let id = saved["id"].as_str().unwrap();
+        let (_, url) = f.postgres.as_ref().expect("disposable PostgreSQL gate required");
+        let mut control = diesel::pg::PgConnection::establish(url).unwrap();
+        control.batch_execute("BEGIN;").unwrap();
+        let mutation = match change {
+            "password" => {
+                "password_hash=decode('010203','hex'),security_stamp='changed-password-stamp',akey='changed-password-wrapper'"
+            }
+            "disable" => "enabled=false",
+            _ => "name='changed-name',password_hint='changed-hint'",
+        };
+        control.batch_execute(&format!("UPDATE users SET {mutation} WHERE uuid='{}';", f.user)).unwrap();
+        let request = f
+            .client
+            .post(format!("{}/api/webauthn/{id}/delete", f.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"masterPasswordHash":PASSWORD}));
+        let deletion = tokio::spawn(async move { request.send().await });
+        f.wait_for_database_wait("pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'")
+            .await;
+        assert!(!deletion.is_finished());
+        control.batch_execute("COMMIT;").unwrap();
+        let result = deletion.await.unwrap().unwrap();
+        if change == "profile" {
+            assert_eq!(result.status(), StatusCode::OK);
+            assert_eq!(f.count("web_authn_credentials"), 0);
+            assert_eq!(
+                f.count("users WHERE name='changed-name' AND password_hint='changed-hint' AND akey='synthetic-key'"),
+                1
+            );
+        } else {
+            assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(f.count("web_authn_credentials"), 1);
+            assert_eq!(f.count("devices WHERE refresh_token='synthetic-refresh'"), 1);
+            if change == "password" {
+                assert_eq!(f.count("users WHERE password_hash=decode('010203','hex') AND security_stamp='changed-password-stamp' AND akey='changed-password-wrapper'"), 1);
+            } else {
+                assert_eq!(f.count("users WHERE enabled=false AND security_stamp='synthetic-stamp'"), 1);
+            }
+        }
     }
 }
 

@@ -5,10 +5,10 @@ use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     crypto,
     db::{DbConn, schema::devices},
-    error::MapResult,
+    error::{Error, MapResult},
     util::{format_date, get_uuid},
 };
 use macros::{IdFromParam, UuidFromParam};
@@ -225,6 +225,34 @@ impl Device {
     pub async fn find_by_refresh_token(refresh_token: &str, conn: &DbConn) -> Option<Self> {
         conn.run(move |conn| devices::table.filter(devices::refresh_token.eq(refresh_token)).first::<Self>(conn).ok())
             .await
+    }
+
+    /// A refresh request must not save a previously loaded Device, which could
+    /// restore a token invalidated by concurrent credential/session revocation.
+    pub async fn touch_if_refresh_token_current(&self, conn: &DbConn) -> ApiResult<bool> {
+        let uuid = self.uuid.clone();
+        let user_uuid = self.user_uuid.clone();
+        let token = self.refresh_token.clone();
+        let updated_at = Utc::now().naive_utc();
+        conn.run(move |conn| {
+            conn.transaction::<_, Error, _>(|conn| {
+                let target = || {
+                    devices::table
+                        .filter(devices::uuid.eq(&uuid))
+                        .filter(devices::user_uuid.eq(&user_uuid))
+                        .filter(devices::refresh_token.eq(&token))
+                };
+                diesel::update(target())
+                    .set(devices::updated_at.eq(updated_at))
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_res("Error updating device activity")?;
+                // MySQL may report zero changed rows for an unchanged timestamp.
+                // The UPDATE holds the row lock until this token check completes.
+                target().count().get_result::<i64>(conn).map(|count| count == 1).map_res("Error checking refresh token")
+            })
+        })
+        .await
     }
 
     pub async fn find_latest_active_by_user(user_uuid: &UserId, conn: &DbConn) -> Option<Self> {

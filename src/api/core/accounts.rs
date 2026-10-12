@@ -1025,7 +1025,8 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
 
         // Update send data
         for send_data in data.account_data.sends {
-            let Some(send) = send_data.id.as_ref().and_then(|id| existing_sends.iter_mut().find(|s| &s.uuid == id)) else {
+            let Some(send) = send_data.id.as_ref().and_then(|id| existing_sends.iter_mut().find(|s| &s.uuid == id))
+            else {
                 err!("Send doesn't exist")
             };
 

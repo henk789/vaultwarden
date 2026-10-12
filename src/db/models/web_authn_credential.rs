@@ -1,17 +1,18 @@
 // Native credential/keyset contract informed by Vaultwarden PR 7297 (AGPL-3.0),
 // branch snapshot at 727fead3a06eabf477ae9abed2ff0328acba7a6f.
 // Transactional lifecycle guards keep vault key rotation and passkey keys consistent.
-use super::{TwoFactor, User, UserId};
+use super::{Device, DeviceId, TwoFactor, User, UserId};
 use crate::{
     api::{ApiResult, EmptyResult},
     crypto,
     db::{
         DbConn, DbConnInner,
-        schema::{twofactor, users, web_authn_credentials, web_authn_login_challenges},
+        schema::{devices, twofactor, users, web_authn_credentials, web_authn_login_challenges},
     },
     error::Error,
     util::get_uuid,
 };
+use chrono::Utc;
 use diesel::prelude::*;
 
 // Opaque encrypted fields and challenge data intentionally have no Debug implementation.
@@ -286,21 +287,77 @@ impl WebAuthnCredential {
         .await
     }
 
-    pub async fn delete_by_uuid_and_user(uuid: &str, user_uuid: &UserId, conn: &DbConn) -> ApiResult<bool> {
+    /// Remove a credential and invalidate every access/refresh/remember token
+    /// in one account-locked transaction. Never save the request's User snapshot:
+    /// rotation, password changes or disabling may have committed while we waited.
+    pub async fn delete_and_revoke(uuid: &str, expected_user: &User, conn: &DbConn) -> ApiResult<Option<User>> {
+        let expected = (
+            expected_user.uuid.clone(),
+            expected_user.security_stamp.clone(),
+            expected_user.password_hash.clone(),
+            expected_user.akey.clone(),
+            expected_user.private_key.clone(),
+            expected_user.public_key.clone(),
+        );
         conn.run(move |conn| {
             conn.transaction::<_, Error, _>(|conn| {
-                diesel::update(users::table.filter(users::uuid.eq(user_uuid)))
-                    .set(users::uuid.eq(user_uuid))
+                diesel::update(users::table.filter(users::uuid.eq(&expected.0)))
+                    .set(users::uuid.eq(&expected.0))
                     .execute(conn)
                     .map_err(|_| unavailable())?;
-                diesel::delete(
+                let mut current =
+                    users::table.filter(users::uuid.eq(&expected.0)).first::<User>(conn).map_err(|_| unavailable())?;
+                if !current.enabled
+                    || current.security_stamp != expected.1
+                    || current.password_hash != expected.2
+                    || current.akey != expected.3
+                    || current.private_key != expected.4
+                    || current.public_key != expected.5
+                {
+                    return Err(Error::new_msg("Account changed. Sync and try again."));
+                }
+                let deleted = diesel::delete(
                     web_authn_credentials::table
                         .filter(web_authn_credentials::uuid.eq(uuid))
-                        .filter(web_authn_credentials::user_uuid.eq(user_uuid)),
+                        .filter(web_authn_credentials::user_uuid.eq(&current.uuid)),
                 )
                 .execute(conn)
-                .map(|n| n == 1)
-                .map_err(|_| unavailable())
+                .map_err(|_| unavailable())?;
+                if deleted == 0 {
+                    return Ok(None);
+                }
+
+                current.security_stamp = get_uuid();
+                current.stamp_exception = None;
+                current.updated_at = Utc::now().naive_utc();
+                diesel::update(users::table.filter(users::uuid.eq(&current.uuid)))
+                    .set((
+                        users::security_stamp.eq(&current.security_stamp),
+                        users::stamp_exception.eq::<Option<String>>(None),
+                        users::updated_at.eq(current.updated_at),
+                    ))
+                    .execute(conn)
+                    .map_err(|_| unavailable())?;
+
+                // Keep push registration metadata for post-commit notification.
+                // Only token fields change; do not replay stale device snapshots.
+                let ids = devices::table
+                    .filter(devices::user_uuid.eq(&current.uuid))
+                    .select(devices::uuid)
+                    .load::<DeviceId>(conn)
+                    .map_err(|_| unavailable())?;
+                for id in ids {
+                    diesel::update(
+                        devices::table.filter(devices::user_uuid.eq(&current.uuid)).filter(devices::uuid.eq(id)),
+                    )
+                    .set((
+                        devices::refresh_token.eq(Device::generate_refresh_token()),
+                        devices::twofactor_remember.eq::<Option<String>>(None),
+                    ))
+                    .execute(conn)
+                    .map_err(|_| unavailable())?;
+                }
+                Ok(Some(current))
             })
         })
         .await

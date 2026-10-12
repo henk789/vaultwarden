@@ -20,7 +20,7 @@ use crate::{
     crypto,
     db::{
         DbConn,
-        models::{Device, PasskeyAccount, TwoFactor, TwoFactorType, User, WebAuthnCredential},
+        models::{PasskeyAccount, TwoFactor, TwoFactorType, User, WebAuthnCredential},
     },
     error::Error,
     util::get_uuid,
@@ -494,7 +494,7 @@ async fn post_api_webauthn(
         err!("Maximum number of passkeys reached")
     }
 
-    let type_ = TwoFactorType::WebauthnPasskeyRegisterChallenge as i32;
+    let type_ = TwoFactorType::WebauthnPasskeyRegisterChallenge;
     let Some(tf) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await else {
         err!("No registration challenge found. Please try again.")
     };
@@ -584,7 +584,7 @@ async fn put_api_webauthn(
         err!("User not found")
     };
 
-    let type_ = TwoFactorType::WebauthnPasskeyAssertionChallenge as i32;
+    let type_ = TwoFactorType::WebauthnPasskeyAssertionChallenge;
     let Some(tf) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await else {
         err!("No assertion challenge found. Please try again.")
     };
@@ -652,18 +652,14 @@ async fn post_api_webauthn_delete(
     crate::ratelimit::check_limit_login(&headers.ip.ip)?;
 
     let data: PasswordOrOtpData = data.into_inner();
-    let mut user = headers.user;
+    let user = headers.user;
 
     data.validate(&user, true, &conn).await?;
 
-    let deleted = WebAuthnCredential::delete_by_uuid_and_user(&uuid, &user.uuid, &conn).await?;
-    if deleted {
-        // Without per-credential session tracking, revoke every session when a
-        // passkey is removed so it cannot continue authenticating through a token.
-        user.reset_security_stamp(&conn).await?;
-        user.save(&conn).await?;
-        nt.send_logout(&user, None, &conn).await;
-        Device::delete_all_by_user(&user.uuid, &conn).await?;
+    if let Some(current_user) = WebAuthnCredential::delete_and_revoke(&uuid, &user, &conn).await? {
+        // Credential removal and session revocation have committed together.
+        // Retain device push metadata so every client can receive the logout.
+        nt.send_logout(&current_user, None, &conn).await;
     } else {
         debug!("post_api_webauthn_delete: credential {uuid} was not registered for user {}", user.uuid);
     }

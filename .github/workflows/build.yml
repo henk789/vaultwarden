@@ -19,6 +19,7 @@ on:
       - "docker/Dockerfile.j2"
       - "docker/DockerSettings.yaml"
       - "macros/**"
+      - "tests/**"
 
   pull_request:
     paths:
@@ -33,6 +34,7 @@ on:
       - "docker/Dockerfile.j2"
       - "docker/DockerSettings.yaml"
       - "macros/**"
+      - "tests/**"
 
 defaults:
   run:
@@ -166,7 +168,7 @@ jobs:
         id: clippy
         if: ${{ !cancelled() && matrix.channel == 'rust-toolchain' }}
         run: |
-          cargo clippy --profile ci --features sqlite,mysql,postgresql,enable_mimalloc,s3
+          cargo clippy --locked --profile ci --all-targets --features sqlite,mysql,postgresql,enable_mimalloc,s3
       # End Run cargo clippy
 
 
@@ -218,3 +220,41 @@ jobs:
         run: |
           echo "### :tada: Checks Passed!" >> "${GITHUB_STEP_SUMMARY}"
           echo "" >> "${GITHUB_STEP_SUMMARY}"
+
+  passkey-postgresql:
+    name: Passkey PostgreSQL lifecycle and concurrency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      # Disposable service only; fixtures create/drop uniquely named databases.
+      VW_PASSKEY_TEST_DATABASE_URL: postgresql://passkey_test:synthetic-passkey-test@127.0.0.1:15432/postgres
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: passkey_test
+          POSTGRES_PASSWORD: synthetic-passkey-test
+          POSTGRES_DB: postgres
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U passkey_test -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq-dev libssl-dev pkg-config
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          TOOLCHAIN="$(grep -m1 -oP 'channel.*"(\K.*?)(?=")' rust-toolchain.toml)"
+          rustup toolchain install "${TOOLCHAIN}" --profile minimal --no-self-update
+      - name: Rust caching
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run every passkey regression, including concurrency and interruption
+        run: cargo test --locked --profile ci --features sqlite,postgresql --test passkey_unlock -- --include-ignored --test-threads=1

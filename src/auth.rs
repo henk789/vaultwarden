@@ -1355,16 +1355,19 @@ pub async fn refresh_tokens(
     };
 
     // Get device by refresh token
-    let Some(mut device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
+    let Some(device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
         err!("Invalid refresh token")
     };
 
-    // Save to update `updated_at`.
-    device.save(true, conn).await?;
-
+    // Load the account before the guarded activity update. If revocation commits
+    // before that update, the device token check fails. If it commits afterward,
+    // the response carries the old security stamp and cannot revive the session.
     let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await else {
         err!("Impossible to find user")
     };
+    if !device.touch_if_refresh_token_current(conn).await? {
+        err!("Invalid refresh token")
+    }
 
     let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
