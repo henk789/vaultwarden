@@ -17,6 +17,10 @@ extend-ignore-re = [
     # COSE Is short for CBOR Object Signing and Encryption, ignore these specific items
     "COSEKey",
     "COSEAlgorithm",
+    "CoseEncrypt0B64",
+    "\\bcose\\b",
+    # OpenSSL's public type name uses this spelling
+    "\\bEncrypter\\b",
     # Ignore this specific string as it's valid
     "Ensure they are valid OTPs",
     # This word is misspelled upstream

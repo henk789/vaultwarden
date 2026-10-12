@@ -194,7 +194,7 @@ pub fn decode_2fa_remember(token: &str) -> Result<TwoFactorRememberClaims, Error
     decode_jwt(token, JWT_2FA_REMEMBER_ISSUER.to_string())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoginJwtClaims {
     // Not before
     pub nbf: i64,
@@ -684,6 +684,10 @@ impl<'r> FromRequest<'r> for Headers {
             err_handler!("Device has no user associated")
         };
 
+        if !user.enabled {
+            err_handler!("This user has been disabled")
+        }
+
         if user.security_stamp != claims.sstamp {
             if let Some(stamp_exception) =
                 user.stamp_exception.as_deref().and_then(|s| serde_json::from_str::<UserStampException>(s).ok())
@@ -698,9 +702,7 @@ impl<'r> FromRequest<'r> for Headers {
                 if Utc::now().timestamp() > stamp_exception.expire {
                     // If the stamp exception has been expired remove it from the database.
                     // This prevents checking this stamp exception for new requests.
-                    let mut user = user;
-                    user.reset_stamp_exception();
-                    if let Err(e) = user.save(&conn).await {
+                    if let Err(e) = user.clear_expired_stamp_exception(&conn).await {
                         error!("Error updating user: {e:#?}");
                     }
                     err_handler!("Stamp exception is expired")
@@ -721,6 +723,12 @@ impl<'r> FromRequest<'r> for Headers {
             ip,
         })
     }
+}
+
+pub async fn session_is_current(claims: &LoginJwtClaims, conn: &DbConn) -> bool {
+    claims.exp > Utc::now().timestamp()
+        && Device::session_is_current(&claims.device, &claims.sub, &claims.sstamp, conn).await
+        && claims.exp > Utc::now().timestamp()
 }
 
 pub struct OrgHeaders {
@@ -1241,6 +1249,7 @@ pub enum AuthMethod {
     Password,
     Sso,
     UserApiKey,
+    Webauthn,
 }
 
 impl AuthMethod {
@@ -1248,7 +1257,7 @@ impl AuthMethod {
         match self {
             AuthMethod::OrgApiKey => "api.organization".to_owned(),
             AuthMethod::UserApiKey => "api".to_owned(),
-            AuthMethod::Password | AuthMethod::Sso => "api offline_access".to_owned(),
+            AuthMethod::Password | AuthMethod::Sso | AuthMethod::Webauthn => "api offline_access".to_owned(),
         }
     }
 
@@ -1354,16 +1363,22 @@ pub async fn refresh_tokens(
     };
 
     // Get device by refresh token
-    let Some(mut device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
+    let Some(device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
         err!("Invalid refresh token")
     };
 
-    // Save to update `updated_at`.
-    device.save(true, conn).await?;
-
+    // Load the account before the guarded activity update. If revocation commits
+    // before that update, the device token check fails. If it commits afterward,
+    // the response carries the old security stamp and cannot revive the session.
     let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await else {
         err!("Impossible to find user")
     };
+    if !user.enabled {
+        err!("This user has been disabled")
+    }
+    if !device.touch_if_refresh_token_current(conn).await? {
+        err!("Invalid refresh token")
+    }
 
     let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
@@ -1375,6 +1390,14 @@ pub async fn refresh_tokens(
         AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
         AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
         AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+        AuthMethod::Webauthn
+            if CONFIG.passkeys_enabled()
+                && CONFIG.is_webauthn_2fa_supported()
+                && !(CONFIG.sso_enabled() && CONFIG.sso_only()) =>
+        {
+            AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
+        }
+        AuthMethod::Webauthn => err!("Passkey sign-in is no longer available"),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 

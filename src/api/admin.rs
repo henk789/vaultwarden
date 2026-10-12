@@ -464,6 +464,9 @@ async fn delete_sso_user(user_id: UserId, token: AdminToken, conn: DbConn) -> Em
 async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
 
+    let expected_user = user.clone();
+    user.reset_security_stamp(&conn).await?;
+    user.save_if_current(&expected_user, &conn).await?;
     nt.send_logout(&user, None, &conn).await;
 
     if CONFIG.push_enabled() {
@@ -475,43 +478,37 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
         }
     }
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
-    user.reset_security_stamp(&conn).await?;
-
-    user.save(&conn).await
+    Ok(())
 }
 
 #[post("/users/<user_id>/disable", format = "application/json")]
 async fn disable_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+    let expected_user = user.clone();
     user.reset_security_stamp(&conn).await?;
     user.enabled = false;
-
-    let save_result = user.save(&conn).await;
-
+    user.save_if_current(&expected_user, &conn).await?;
     nt.send_logout(&user, None, &conn).await;
-
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
-
-    save_result
+    Ok(())
 }
 
 #[post("/users/<user_id>/enable", format = "application/json")]
 async fn enable_user(user_id: UserId, _token: AdminToken, conn: DbConn) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+    let expected_user = user.clone();
     user.enabled = true;
-
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[post("/users/<user_id>/remove-2fa", format = "application/json")]
 async fn remove_2fa(user_id: UserId, token: AdminToken, conn: DbConn) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+    let expected_user = user.clone();
     TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
     Device::clear_twofactor_remember_by_user(&user.uuid, &conn).await?;
     two_factor::enforce_2fa_policy(&user, &ACTING_ADMIN_USER.into(), 14, &token.ip.ip, &conn).await?;
     user.totp_recover = None;
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[post("/users/<user_id>/invite/resend", format = "application/json")]

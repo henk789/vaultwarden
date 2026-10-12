@@ -8,6 +8,8 @@ use rocket::{
     serde::json::Json,
 };
 use serde_json::Value;
+use webauthn_rs::prelude::{Credential as WebauthnCredentialData, Passkey, PasskeyAuthentication};
+use webauthn_rs_proto::{PublicKeyCredential, UserVerificationPolicy};
 
 use crate::{
     CONFIG,
@@ -16,6 +18,7 @@ use crate::{
         core::{
             accounts::{PreloginData, RegisterData, kdf_upgrade, prelogin, register},
             log_user_event,
+            two_factor::webauthn::WEBAUTHN,
             two_factor::{
                 authenticator, duo_oidc, email, enforce_2fa_policy, is_twofactor_provider_usable, webauthn, yubikey,
             },
@@ -31,7 +34,7 @@ use crate::{
         models::{
             AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
             OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            TwoFactorType, User, UserId, WebAuthnCredential, WebAuthnLoginChallenge,
         },
     },
     error::MapResult,
@@ -50,7 +53,8 @@ pub fn routes() -> Vec<Route> {
         prevalidate,
         authorize,
         oidcsignin,
-        oidcsignin_error
+        oidcsignin_error,
+        get_webauthn_login_assertion_options
     ]
 }
 
@@ -65,7 +69,18 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.refresh_token.as_ref(), "refresh_token cannot be blank")?;
             refresh_login(data, &conn, &client_header.ip).await
         }
-        "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
+        "webauthn" | "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
+        "webauthn" if CONFIG.passkeys_enabled() && CONFIG.is_webauthn_2fa_supported() => {
+            check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
+            check_is_some(data.token.as_ref(), "token cannot be blank")?;
+            check_is_some(data.device_response.as_ref(), "deviceResponse cannot be blank")?;
+            check_is_some(data.scope.as_ref(), "scope cannot be blank")?;
+            check_is_some(data.device_identifier.as_ref(), "device_identifier cannot be blank")?;
+            check_is_some(data.device_name.as_ref(), "device_name cannot be blank")?;
+            check_is_some(data.device_type.as_ref(), "device_type cannot be blank")?;
+            webauthn_login(data, &mut user_id, &conn, &client_header.ip).await
+        }
+        "webauthn" => err!("Passkey sign-in is not enabled"),
         "password" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
             check_is_some(data.password.as_ref(), "password cannot be blank")?;
@@ -160,10 +175,9 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
                 format!("Unable to refresh login credentials: {}", err.message())
             )
         }
-        Ok((mut device, auth_tokens)) => {
-            // Save to update `device.updated_at` to track usage and toggle new status
-            device.save(true, conn).await?;
-
+        Ok((_, auth_tokens)) => {
+            // Device activity was already updated with a refresh-token guard.
+            // Saving that snapshot again could restore a concurrently revoked token.
             let result = json!({
                 "refresh_token": auth_tokens.refresh_token(),
                 "access_token": auth_tokens.access_token(),
@@ -338,13 +352,14 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
             let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
 
             if user.private_key.is_none() {
+                let expected_user = user.clone();
                 // User was invited a stub was created
                 user.verified_at = Some(now);
                 if let Some(ref user_name) = user_infos.user_name {
                     user.name = user_name.clone();
                 }
 
-                user.save(conn).await?;
+                user.save_if_current(&expected_user, conn).await?;
             }
 
             if user.email != user_infos.email {
@@ -453,10 +468,11 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             if resend_limit == 0 || user.login_verify_count < resend_limit {
                 // We want to send another email verification if we require signups to verify
                 // their email address, and we haven't sent them a reminder in a while...
+                let expected_user = user.clone();
                 user.last_verifying_at = Some(now);
                 user.login_verify_count += 1;
 
-                if let Err(e) = user.save(conn).await {
+                if let Err(e) = user.save_if_current(&expected_user, conn).await {
                     error!("Error updating user: {e:#?}");
                 }
 
@@ -498,9 +514,121 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
+// The discoverable request does not identify an account. Keep challenge state in the
+// database and consume it atomically before WebAuthn verification.
+#[get("/accounts/webauthn/assertion-options")]
+async fn get_webauthn_login_assertion_options(conn: DbConn, ip: ClientIp) -> JsonResult {
+    if !CONFIG.passkeys_enabled() || !CONFIG.is_webauthn_2fa_supported() || (CONFIG.sso_enabled() && CONFIG.sso_only())
+    {
+        err!("Passkey sign-in is not enabled")
+    }
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+    let (mut response, state) = WEBAUTHN.start_passkey_authentication(&[])?;
+    response.public_key.allow_credentials.clear();
+    response.public_key.user_verification = UserVerificationPolicy::Required;
+    let token = util::get_uuid();
+    WebAuthnLoginChallenge::create(&token, serde_json::to_string(&state)?, Utc::now().timestamp(), &conn).await?;
+    Ok(Json(json!({
+        "options": response.public_key,
+        "token": token,
+        "object": "webAuthnLoginAssertionOptions"
+    })))
+}
+
+async fn webauthn_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
+    AuthMethod::Webauthn.check_scope(data.scope.as_ref())?;
+    crate::ratelimit::check_limit_login(&ip.ip)?;
+    let response: PublicKeyCredential = serde_json::from_str(data.device_response.as_deref().unwrap())
+        .map_err(|_| crate::error::Error::new_msg("Invalid passkey assertion"))?;
+    let token = data.token.as_deref().unwrap();
+    let Some(state_json) = WebAuthnLoginChallenge::consume(token, Utc::now().timestamp(), conn).await? else {
+        err!("Invalid or expired passkey challenge")
+    };
+    let hash = crate::api::core::passkeys::passkey_credential_id_hash(response.raw_id.as_slice());
+    let Some((mut credential, user)) = WebAuthnCredential::find_login_account(&hash, conn).await? else {
+        err!("Invalid passkey assertion")
+    };
+    *user_id = Some(user.uuid.clone());
+    if !user.enabled {
+        err!("This user has been disabled")
+    }
+    // Apply the same email verification gate as normal password sign-in.
+    if user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
+        err!("Please verify your email before trying again.")
+    }
+    let Some(handle) = response.response.user_handle.as_ref() else {
+        err!("Invalid passkey user handle")
+    };
+    let expected_uuid =
+        uuid::Uuid::parse_str(&user.uuid).map_err(|_| crate::error::Error::new_msg("Invalid passkey user handle"))?;
+    if !crypto::ct_eq(handle.as_slice(), expected_uuid.as_bytes()) {
+        err!("Invalid passkey user handle")
+    }
+    let previous = credential.credential.clone();
+    let mut passkey: Passkey =
+        serde_json::from_str(&previous).map_err(|_| crate::error::Error::new_msg("Invalid stored passkey"))?;
+    if !crypto::ct_eq(passkey.cred_id().as_slice(), response.raw_id.as_slice()) {
+        err!("Invalid passkey credential")
+    }
+    // Discoverable assertion handling follows the state/credential approach in
+    // Vaultwarden PR 7370 (branch snapshot f7f2007), with database-backed one-use state here.
+    let mut state: Value = serde_json::from_str(&state_json)?;
+    let Some(credentials) = state.pointer_mut("/ast/credentials").and_then(Value::as_array_mut) else {
+        err!("Invalid passkey challenge state")
+    };
+    credentials.push(serde_json::to_value(WebauthnCredentialData::from(passkey.clone()))?);
+    let state: PasskeyAuthentication = serde_json::from_value(state)?;
+    let verified = WEBAUTHN
+        .finish_passkey_authentication(&response, &state)
+        .map_err(|_| crate::error::Error::new_msg("Invalid passkey assertion"))?;
+    if !crypto::ct_eq(verified.cred_id().as_slice(), passkey.cred_id().as_slice()) {
+        err!("Invalid passkey credential")
+    }
+    let previous_counter = crate::api::core::passkeys::passkey_counter(&passkey);
+    let backup_eligible = WebauthnCredentialData::from(passkey.clone()).backup_eligible;
+    // Synced passkeys may have zero counters. For non-backup hardware passkeys,
+    // positive counters must strictly increase.
+    if !backup_eligible && previous_counter > 0 && verified.counter() > 0 && verified.counter() <= previous_counter {
+        err!("Passkey signature counter did not advance")
+    }
+    if passkey.update_credential(&verified) == Some(true) && verified.counter() > previous_counter {
+        credential.credential = serde_json::to_string(&passkey)?;
+        credential.update_authentication(&previous, conn).await?;
+    }
+    // Rotation or deletion may have committed during assertion verification.
+    // Build the token and PRF response from one current account/credential pair.
+    let Some((current_credential, current_user)) = WebAuthnCredential::find_login_account(&hash, conn).await? else {
+        err!("Passkey changed. Please try again.")
+    };
+    if !WebAuthnCredential::same_login_epoch(&credential, &user, &current_credential, &current_user) {
+        err!("Account or passkey changed. Please try again.")
+    }
+    if !current_user.enabled {
+        err!("This user has been disabled")
+    }
+    if current_user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
+        err!("Please verify your email before trying again.")
+    }
+    // User verification by the authenticator satisfies this grant's login factor.
+    // Other grants retain their existing two-step-login behavior and enrollment.
+    let mut device = get_device(&data, conn, &current_user).await?;
+    let tokens = auth::AuthTokens::new(&device, &current_user, AuthMethod::Webauthn, data.client_id);
+    let mut result = authenticated_response(&current_user, &mut device, tokens, None, conn, ip).await?;
+    if current_credential.has_prf_keyset() {
+        let value = &mut result.0["UserDecryptionOptions"]["WebAuthnPrfOption"];
+        *value = json!({
+            "CredentialId": passkey.cred_id(),
+            "Transports": WebauthnCredentialData::from(passkey).transports.unwrap_or_default(),
+            "EncryptedPrivateKey": current_credential.encrypted_private_key,
+            "EncryptedUserKey": current_credential.encrypted_user_key,
+        });
+    }
+    Ok(result)
+}
+
 async fn authenticated_response(
     user: &User,
-    device: &mut Device,
+    device: &mut LoginDevice,
     auth_tokens: auth::AuthTokens,
     twofactor_token: Option<String>,
     conn: &DbConn,
@@ -527,8 +655,8 @@ async fn authenticated_response(
         register_push_device(device, conn).await?;
     }
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Publish only after slow external work, under the account/revocation lock.
+    device.publish(user, conn).await?;
 
     let master_password_policy = identity_master_password_policy(user, conn).await;
 
@@ -684,8 +812,8 @@ async fn user_api_key_login(
     // let orgs = Membership::find_confirmed_by_user(&user.uuid, conn).await;
     let access_claims = auth::LoginJwtClaims::default(&device, &user, &AuthMethod::UserApiKey, data.client_id);
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // API-key grants obey the same final account/session publication guard.
+    device.publish(&user, conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
 
@@ -775,8 +903,32 @@ async fn organization_api_key_login(data: ConnectData, conn: &DbConn, ip: &Clien
     })))
 }
 
-/// Retrieves an existing device or creates a new device from ConnectData and the User
-async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult<Device> {
+struct LoginDevice {
+    device: Device,
+    // None means this request created an unpersisted device, not a missing old
+    // session. An existing device's original token must still match at commit.
+    expected_token: Option<String>,
+}
+
+impl std::ops::Deref for LoginDevice {
+    type Target = Device;
+    fn deref(&self) -> &Device {
+        &self.device
+    }
+}
+impl std::ops::DerefMut for LoginDevice {
+    fn deref_mut(&mut self) -> &mut Device {
+        &mut self.device
+    }
+}
+impl LoginDevice {
+    async fn publish(&mut self, user: &User, conn: &DbConn) -> EmptyResult {
+        self.device.save_for_login(user, self.expected_token.as_deref(), conn).await
+    }
+}
+
+/// Load a device without publishing a new session before authentication finishes.
+async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult<LoginDevice> {
     // On iOS, device_type sends "iOS", on others it sends a number
     // When unknown or unable to parse, return 14, which is 'Unknown Browser'
     let device_type = util::try_parse_string(data.device_type.as_ref()).unwrap_or(14);
@@ -785,12 +937,17 @@ async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult
 
     // Find device or create new
     if let Some(device) = Device::find_by_uuid_and_user(&device_id, &user.uuid, conn).await {
-        Ok(device)
+        let expected_token = Some(device.refresh_token.clone());
+        Ok(LoginDevice {
+            device,
+            expected_token,
+        })
     } else {
-        let mut device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
-        // save device without updating `device.updated_at`
-        device.save(false, conn).await?;
-        Ok(device)
+        let device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
+        Ok(LoginDevice {
+            device,
+            expected_token: None,
+        })
     }
 }
 
@@ -913,8 +1070,9 @@ async fn twofactor_auth(
             }
 
             // Remove the recovery code, not needed without twofactors
+            let expected_user = user.clone();
             user.totp_recover = None;
-            user.save(conn).await?;
+            user.save_if_current(&expected_user, conn).await?;
         }
         _ => err!(
             "Invalid two factor provider",
@@ -1008,6 +1166,8 @@ async fn json_err_twofactor(providers: &[i32], user: &User, data: &ConnectData, 
                 | TwoFactorType::U2fRegisterChallenge
                 | TwoFactorType::Webauthn
                 | TwoFactorType::WebauthnLoginChallenge
+                | TwoFactorType::WebauthnPasskeyRegisterChallenge
+                | TwoFactorType::WebauthnPasskeyAssertionChallenge
                 | TwoFactorType::WebauthnRegisterChallenge,
             ) => { /* Nothing special to do for these providers */ }
         }
@@ -1161,6 +1321,13 @@ struct ConnectData {
     code: Option<OIDCCode>,
     #[field(name = uncased("code_verifier"))]
     code_verifier: Option<OIDCCodeVerifier>,
+
+    // Needed for grant_type="webauthn". Native clients send deviceResponse as JSON text.
+    #[field(name = uncased("token"))]
+    token: Option<String>,
+    #[field(name = uncased("deviceResponse"))]
+    #[field(name = uncased("device_response"))]
+    device_response: Option<String>,
 
     // Needed for send access
     send_id: Option<SendId>,

@@ -58,6 +58,8 @@ pub fn is_twofactor_provider_usable(provider_type: &TwoFactorType, provider_data
         | TwoFactorType::U2fRegisterChallenge
         | TwoFactorType::U2fLoginChallenge
         | TwoFactorType::EmailVerificationChallenge
+        | TwoFactorType::WebauthnPasskeyRegisterChallenge
+        | TwoFactorType::WebauthnPasskeyAssertionChallenge
         | TwoFactorType::WebauthnRegisterChallenge
         | TwoFactorType::WebauthnLoginChallenge
         | TwoFactorType::ProtectedActions => false,
@@ -116,9 +118,10 @@ async fn get_recover(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
 async fn generate_recover_code(user: &mut User, conn: &DbConn) {
     if user.totp_recover.is_none() {
+        let expected_user = user.clone();
         let totp_recover = crypto::encode_random_bytes::<20>(&BASE32);
         user.totp_recover = Some(totp_recover);
-        user.save(conn).await.ok();
+        user.save_if_current(&expected_user, conn).await.ok();
     }
 }
 

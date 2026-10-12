@@ -23,7 +23,7 @@ use crate::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
             EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
             MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType,
+            UserKdfType, UserProfileUpdate,
         },
     },
     mail,
@@ -348,7 +348,9 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     let password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(password_hint.as_ref())?;
 
-    let mut user = match User::find_by_mail(&email, &conn).await {
+    let existing_user = User::find_by_mail(&email, &conn).await;
+    let expected_user = existing_user.clone();
+    let mut user = match existing_user {
         Some(user) => {
             if !user.password_hash.is_empty() {
                 err!("Registration not allowed or user already exists")
@@ -427,7 +429,11 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
         }
     }
 
-    user.save(&conn).await?;
+    if let Some(expected) = expected_user {
+        user.save_if_current(&expected, &conn).await?;
+    } else {
+        user.save(&conn).await?;
+    }
 
     // accept any open emergency access invitations
     if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
@@ -445,6 +451,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
 async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: SetPasswordData = data.into_inner();
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     if user.private_key.is_some() || !user.password_hash.is_empty() {
         err!("Account already initialized, cannot set password")
@@ -495,7 +502,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
-    user.save(&conn).await?;
+    user.save_if_current(&expected_user, &conn).await?;
 
     Ok(Json(json!({
       "object": "set-password",
@@ -529,10 +536,7 @@ async fn post_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) -
         err!("The field Name must be a string with a maximum length of 50.");
     }
 
-    let mut user = headers.user;
-    user.name = data.name;
-
-    user.save(&conn).await?;
+    let user = headers.user.update_profile(UserProfileUpdate::Name(data.name), &conn).await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
@@ -555,10 +559,7 @@ async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> J
         err!("The field AvatarColor must be a HTML/Hex color code with a length of 7 characters")
     }
 
-    let mut user = headers.user;
-    user.avatar_color = data.avatar_color;
-
-    user.save(&conn).await?;
+    let user = headers.user.update_profile(UserProfileUpdate::Avatar(data.avatar_color), &conn).await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
@@ -604,11 +605,7 @@ async fn post_keys(data: Json<KeysData>, headers: Headers, conn: DbConn) -> Json
     if user.private_key.is_some() || user.public_key.is_some() {
         err!("User has existing keypair")
     }
-
-    user.private_key = Some(data.encrypted_private_key);
-    user.public_key = Some(data.public_key);
-
-    user.save(&conn).await?;
+    user.replace_keypair_if_current(data.encrypted_private_key, data.public_key, &conn).await?;
 
     Ok(Json(json!({
         "privateKey": user.private_key,
@@ -659,6 +656,7 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
         };
 
     let mut user = user;
+    let expected_user = user.clone();
 
     user.password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(user.password_hint.as_ref())?;
@@ -677,14 +675,14 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     )
     .await?;
 
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
     nt.send_logout(&user, Some(&headers.device), &conn).await;
 
-    save_result
+    Ok(())
 }
 
 fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
@@ -774,6 +772,7 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
     data.authentication_data.check(&headers.user, &data.unlock_data)?;
 
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     set_kdf_data(&mut user, &data.unlock_data.kdf)?;
 
@@ -785,11 +784,11 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
         &conn,
     )
     .await?;
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, Some(&headers.device), &conn).await;
 
-    save_result
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -829,6 +828,8 @@ struct KeyData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RotateAccountUnlockData {
+    #[serde(default)]
+    passkey_unlock_data: Vec<super::passkeys::PasskeyUnlockData>,
     emergency_access_unlock_data: Vec<UpdateEmergencyAccessData>,
     master_password_unlock_data: MasterPasswordUnlockData,
     organization_account_recovery_unlock_data: Vec<UpdateResetPasswordData>,
@@ -941,8 +942,7 @@ fn validate_keydata(
 
 #[post("/accounts/key-management/rotate-user-account-keys", data = "<data>")]
 async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    // TODO: See if we can wrap everything within a SQL Transaction. If something fails it should revert everything.
-    let data: KeyData = data.into_inner();
+    let mut data: KeyData = data.into_inner();
 
     if !headers.user.check_valid_password(&data.old_master_key_authentication_hash) {
         err!("Invalid password")
@@ -954,114 +954,147 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     Cipher::validate_cipher_data(&data.account_data.ciphers)?;
 
-    let user_id = &headers.user.uuid;
-
-    // TODO: Ideally we'd do everything after this point in a single transaction.
-
-    let mut existing_ciphers = Cipher::find_owned_by_user(user_id, &conn).await;
-    let mut existing_folders = Folder::find_by_user(user_id, &conn).await;
-    let mut existing_emergency_access = EmergencyAccess::find_all_confirmed_by_grantor_uuid(user_id, &conn).await;
-    let mut existing_memberships = Membership::find_by_user(user_id, &conn).await;
-    // We only rotate the reset password key if it is set.
-    existing_memberships.retain(|m| m.reset_password_key.is_some());
-    let mut existing_sends = Send::find_by_user(user_id, &conn).await;
-
-    validate_keydata(
-        &data,
-        &existing_ciphers,
-        &existing_folders,
-        &existing_emergency_access,
-        &existing_memberships,
-        &existing_sends,
-        &headers.user,
-    )?;
-
-    // Update folder data
-    for folder_data in data.account_data.folders {
-        // Skip `null` folder id entries.
-        // See: https://github.com/bitwarden/clients/issues/8453
-        if let Some(folder_id) = folder_data.id {
-            let Some(saved_folder) = existing_folders.iter_mut().find(|f| f.uuid == folder_id) else {
-                err!("Folder doesn't exist")
-            };
-
-            saved_folder.name = folder_data.name;
-            saved_folder.save(&conn).await?;
+    let atomic_passkeys = CONFIG.passkeys_enabled()
+        || !crate::db::models::WebAuthnCredential::find_by_user(&headers.user.uuid, &conn).await?.is_empty();
+    let rotation = async {
+        if atomic_passkeys {
+            crate::db::models::PasskeyAccount::from_user(&headers.user)?.lock_for_rotation(&conn).await?;
         }
-    }
+        let user_id = &headers.user.uuid;
 
-    // Update emergency access data
-    for emergency_access_data in data.account_unlock_data.emergency_access_unlock_data {
-        let Some(saved_emergency_access) =
-            existing_emergency_access.iter_mut().find(|ea| ea.uuid == emergency_access_data.id)
-        else {
-            err!("Emergency access doesn't exist or is not owned by the user")
-        };
+        let mut existing_ciphers = Cipher::find_owned_by_user(user_id, &conn).await;
+        let mut existing_folders = Folder::find_by_user(user_id, &conn).await;
+        let mut existing_emergency_access = EmergencyAccess::find_all_confirmed_by_grantor_uuid(user_id, &conn).await;
+        let mut existing_memberships = Membership::find_by_user(user_id, &conn).await;
+        // We only rotate the reset password key if it is set.
+        existing_memberships.retain(|m| m.reset_password_key.is_some());
+        let mut existing_sends = Send::find_by_user(user_id, &conn).await;
 
-        saved_emergency_access.key_encrypted = Some(emergency_access_data.key_encrypted);
-        saved_emergency_access.save(&conn).await?;
-    }
+        validate_keydata(
+            &data,
+            &existing_ciphers,
+            &existing_folders,
+            &existing_emergency_access,
+            &existing_memberships,
+            &existing_sends,
+            &headers.user,
+        )?;
 
-    // Update reset password data
-    for reset_password_data in data.account_unlock_data.organization_account_recovery_unlock_data {
-        let Some(membership) =
-            existing_memberships.iter_mut().find(|m| m.org_uuid == reset_password_data.organization_id)
-        else {
-            err!("Reset password doesn't exist")
-        };
+        // Validate native PRF rewraps before changing any existing vault data.
+        let passkey_rewraps = super::passkeys::prepare_rotation(
+            &headers.user,
+            std::mem::take(&mut data.account_unlock_data.passkey_unlock_data),
+            &conn,
+        )
+        .await?;
 
-        membership.reset_password_key = Some(reset_password_data.reset_password_key);
-        membership.save(&conn).await?;
-    }
+        // Update folder data
+        for folder_data in data.account_data.folders {
+            // Skip `null` folder id entries.
+            // See: https://github.com/bitwarden/clients/issues/8453
+            if let Some(folder_id) = folder_data.id {
+                let Some(saved_folder) = existing_folders.iter_mut().find(|f| f.uuid == folder_id) else {
+                    err!("Folder doesn't exist")
+                };
 
-    // Update send data
-    for send_data in data.account_data.sends {
-        let Some(send) = send_data.id.as_ref().and_then(|id| existing_sends.iter_mut().find(|s| &s.uuid == id)) else {
-            err!("Send doesn't exist")
-        };
+                saved_folder.name = folder_data.name;
+                saved_folder.save(&conn).await?;
+            }
+        }
 
-        // Like upstream, only the key changes on rotation
-        send.akey = send_data.key;
-        send.save(&conn).await?;
-    }
-
-    // Update cipher data
-    for cipher_data in data.account_data.ciphers {
-        if cipher_data.organization_id.is_none() {
-            let Some(saved_cipher) =
-                cipher_data.id.as_ref().and_then(|id| existing_ciphers.iter_mut().find(|c| &c.uuid == id))
+        // Update emergency access data
+        for emergency_access_data in data.account_unlock_data.emergency_access_unlock_data {
+            let Some(saved_emergency_access) =
+                existing_emergency_access.iter_mut().find(|ea| ea.uuid == emergency_access_data.id)
             else {
-                err!("Cipher doesn't exist")
+                err!("Emergency access doesn't exist or is not owned by the user")
             };
 
-            // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
-            // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
-            // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+            saved_emergency_access.key_encrypted = Some(emergency_access_data.key_encrypted);
+            saved_emergency_access.save(&conn).await?;
         }
-    }
 
-    // Update user data
-    let mut user = headers.user;
+        // Update reset password data
+        for reset_password_data in data.account_unlock_data.organization_account_recovery_unlock_data {
+            let Some(membership) =
+                existing_memberships.iter_mut().find(|m| m.org_uuid == reset_password_data.organization_id)
+            else {
+                err!("Reset password doesn't exist")
+            };
 
-    user.private_key = Some(data.account_keys.user_key_encrypted_account_private_key);
-    user.set_password(
-        &data.account_unlock_data.master_password_unlock_data.master_key_authentication_hash,
-        Some(data.account_unlock_data.master_password_unlock_data.master_key_encrypted_user_key),
-        true,
-        None,
-        &conn,
-    )
-    .await?;
+            membership.reset_password_key = Some(reset_password_data.reset_password_key);
+            membership.save(&conn).await?;
+        }
 
-    let save_result = user.save(&conn).await;
+        // Update send data
+        for send_data in data.account_data.sends {
+            let Some(send) = send_data.id.as_ref().and_then(|id| existing_sends.iter_mut().find(|s| &s.uuid == id))
+            else {
+                err!("Send doesn't exist")
+            };
 
-    // Prevent logging out the client where the user requested this endpoint from.
-    // If you do logout the user it will causes issues at the client side.
-    // Adding the device uuid will prevent this.
-    nt.send_logout(&user, Some(&headers.device), &conn).await;
+            // Preserve upstream send-key rotation semantics.
+            send.akey = send_data.key;
+            send.save(&conn).await?;
+        }
 
-    save_result
+        // Update cipher data
+        for cipher_data in data.account_data.ciphers {
+            if cipher_data.organization_id.is_none() {
+                let Some(saved_cipher) =
+                    cipher_data.id.as_ref().and_then(|id| existing_ciphers.iter_mut().find(|c| &c.uuid == id))
+                else {
+                    err!("Cipher doesn't exist")
+                };
+
+                // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
+                // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
+                // We force the users to logout after the user has been saved to try and prevent these issues.
+                update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None)
+                    .await?;
+            }
+        }
+
+        // Update user data
+        let mut user = headers.user;
+        let expected_user = user.clone();
+
+        user.private_key = Some(data.account_keys.user_key_encrypted_account_private_key);
+        user.set_password(
+            &data.account_unlock_data.master_password_unlock_data.master_key_authentication_hash,
+            Some(data.account_unlock_data.master_password_unlock_data.master_key_encrypted_user_key),
+            true,
+            None,
+            &conn,
+        )
+        .await?;
+
+        let save_result = user.save_if_current(&expected_user, &conn).await;
+        let save_result = match save_result {
+            Ok(()) if !passkey_rewraps.is_empty() => {
+                // Old PRF rows are no longer exposed once the encrypted account private
+                // key changes. A failed atomic rewrap leaves master-password fallback.
+                match crate::db::models::PasskeyAccount::from_user(&user) {
+                    Ok(account) => {
+                        crate::db::models::WebAuthnCredential::rewrap_all(&account, passkey_rewraps, &conn).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        };
+
+        save_result?;
+        Ok((user, headers.device))
+    };
+    let (user, device) = if atomic_passkeys {
+        conn.transaction(rotation).await?
+    } else {
+        rotation.await?
+    };
+    // Notify only after commit. Preserve the initiating client's native session behavior.
+    nt.send_logout(&user, Some(&device), &conn).await;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1073,12 +1106,13 @@ struct KeyIdData {
 #[post("/accounts/key-management/user-key-id", data = "<data>")]
 async fn post_user_key(data: Json<KeyIdData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let mut user = headers.user;
+    let expected_user = user.clone();
     if user.key_id.is_some() {
         err_code!("Unexpected data", Status::UnprocessableEntity.code);
     }
 
     user.key_id = Some(data.into_inner().user_key_id);
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[post("/accounts/security-stamp", data = "<data>")]
@@ -1088,14 +1122,13 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&user, true, &conn).await?;
 
+    let expected_user = user.clone();
     user.reset_security_stamp(&conn).await?;
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
-
-    save_result
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1151,9 +1184,10 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
         debug!("Email change request for user ({}) to email ({}) with token ({token})", user.uuid, data.new_email);
     }
 
+    let expected_user = user.clone();
     user.email_new = Some(data.new_email);
     user.email_new_token = Some(token);
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[derive(Deserialize)]
@@ -1175,6 +1209,7 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     let data: ChangeEmailData = data.into_inner();
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     if !user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password")
@@ -1212,11 +1247,11 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     user.set_password(&data.new_master_password_hash, Some(data.key), true, None, &conn).await?;
 
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 
-    save_result
+    Ok(())
 }
 
 #[post("/accounts/verify-email")]
@@ -1255,10 +1290,11 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     if claims.sub != *user.uuid {
         err!("Invalid claim");
     }
+    let expected_user = user.clone();
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn).await {
+    if let Err(e) = user.save_if_current(&expected_user, &conn).await {
         error!("Error saving email verification: {e:#?}");
     }
 
@@ -1449,12 +1485,11 @@ struct SecretVerificationRequest {
 // Change the KDF Iterations if necessary
 pub async fn kdf_upgrade(user: &mut User, pwd_hash: &str, conn: &DbConn) -> ApiResult<()> {
     if user.password_iterations < CONFIG.password_iterations() {
+        let expected_user = user.clone();
         user.password_iterations = CONFIG.password_iterations();
         user.set_password(pwd_hash, None, false, None, conn).await?;
 
-        if let Err(e) = user.save(conn).await {
-            error!("Error updating user: {e:#?}");
-        }
+        user.save_if_current(&expected_user, conn).await?;
     }
     Ok(())
 }
@@ -1480,8 +1515,9 @@ async fn update_api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: He
     data.validate(&user, true, &conn).await?;
 
     if rotate || user.api_key.is_none() {
+        let expected_user = user.clone();
         user.api_key = Some(crypto::generate_api_key());
-        user.save(&conn).await.expect("Error saving API key");
+        user.save_if_current(&expected_user, &conn).await?;
     }
 
     Ok(Json(json!({
