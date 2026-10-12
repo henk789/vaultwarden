@@ -605,6 +605,9 @@ async fn webauthn_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
     if !current_user.enabled {
         err!("This user has been disabled")
     }
+    if current_user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
+        err!("Please verify your email before trying again.")
+    }
     // User verification by the authenticator satisfies this grant's login factor.
     // Other grants retain their existing two-step-login behavior and enrollment.
     let mut device = get_device(&data, conn, &current_user).await?;
