@@ -1,0 +1,10 @@
+# Only reviewed, individually identified exceptions. New advisories still fail.
+# Reachability, dependency paths, and removal conditions: docs/dependency-advisories.md.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa is now only an OIDC public-signature verifier; JWT private signing uses AWS-LC. Re-review if private RSA operations are introduced." },
+    { id = "RUSTSEC-2026-0098", reason = "Rocket's old webpki is server-only with NoClientAuth; Rocket mTLS is not enabled. Re-review any TLS/client-auth feature change." },
+    { id = "RUSTSEC-2026-0099", reason = "Rocket's old webpki is server-only with NoClientAuth; Rocket mTLS is not enabled. Re-review any TLS/client-auth feature change." },
+    { id = "RUSTSEC-2026-0104", reason = "The Rocket TLS path does not configure or parse CRLs. Re-review if CRL support or mTLS is introduced." },
+    { id = "RUSTSEC-2025-0134", reason = "Unmaintained Rocket transitive PEM parser processes administrator-supplied startup certificate/key files. Remove when Rocket updates its TLS dependencies." },
+]

@@ -14,7 +14,7 @@ use crate::{
     CONFIG, Error,
     auth::{ClientIp, WsAccessTokenHeader},
     db::{
-        DbConn,
+        DbConn, DbPool,
         models::{AuthRequestId, Cipher, CollectionId, Device, DeviceId, Folder, PushId, Send as DbSend, User, UserId},
     },
 };
@@ -128,12 +128,14 @@ impl Drop for WSAnonymousEntryMapGuard {
 
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
-fn websockets_hub<'r>(
+async fn websockets_hub(
     ws: WebSocket,
     data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
-) -> Result<rocket_ws::Stream!['r], Error> {
+    conn: DbConn,
+    pool: &rocket::State<DbPool>,
+) -> Result<rocket_ws::Stream!['_], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
     let token = if let Some(token) = data.access_token {
@@ -148,6 +150,15 @@ fn websockets_hub<'r>(
         err_code!("Invalid token", 401)
     };
 
+    if !crate::auth::session_is_current(&claims, &conn).await {
+        err_code!("Session revoked or account disabled", 401)
+    }
+    let pool = pool.inner().clone();
+    let mut session_check = tokio::time::interval(Duration::from_secs(1));
+    let mut expiry = Box::pin(tokio::time::sleep(Duration::from_secs(
+        claims.exp.saturating_sub(Utc::now().timestamp()).max(0).cast_unsigned(),
+    )));
+
     let (mut rx, guard) = {
         let users = Arc::clone(&WS_USERS);
 
@@ -157,7 +168,7 @@ fn websockets_hub<'r>(
         users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
-        (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, ip.ip))
+        (rx, WSEntryMapGuard::new(users, claims.sub.clone(), entry_uuid, ip.ip))
     };
 
     Ok({
@@ -201,10 +212,27 @@ fn websockets_hub<'r>(
                     }
 
                     res = rx.recv() => {
+                        // Never deliver queued events using a now-revoked token.
+                        if !current_ws_session(&claims, &pool).await {
+                            yield Message::Close(None);
+                            break;
+                        }
                         match res {
                             Some(res) => yield res,
                             None => break,
                         }
+                    }
+
+                    _ = session_check.tick() => {
+                        if !current_ws_session(&claims, &pool).await {
+                            yield Message::Close(None);
+                            break;
+                        }
+                    }
+
+                    () = &mut expiry => {
+                        yield Message::Close(None);
+                        break;
                     }
 
                     _ = interval.tick() => {
@@ -218,6 +246,24 @@ fn websockets_hub<'r>(
             }
         }}
     })
+}
+
+async fn current_ws_session(claims: &crate::auth::LoginJwtClaims, pool: &DbPool) -> bool {
+    // Do not retain a connection for the socket's lifetime. Run the blocking
+    // query separately so a stalled database cannot also stall socket expiry.
+    // JoinSet aborts the check on timeout or cancellation of this subscription.
+    let pool = pool.clone();
+    let claims = claims.clone();
+    let mut check = tokio::task::JoinSet::new();
+    check.spawn(async move {
+        match pool.get().await {
+            Ok(conn) => crate::auth::session_is_current(&claims, &conn).await,
+            Err(_) => false,
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), check.join_next())
+        .await
+        .is_ok_and(|result| matches!(result, Some(Ok(true))))
 }
 
 #[expect(tail_expr_drop_order)]

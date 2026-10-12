@@ -352,13 +352,14 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
             let twofactor_token = twofactor_auth(&mut user, &data, &mut device, ip, conn).await?;
 
             if user.private_key.is_none() {
+                let expected_user = user.clone();
                 // User was invited a stub was created
                 user.verified_at = Some(now);
                 if let Some(ref user_name) = user_infos.user_name {
                     user.name = user_name.clone();
                 }
 
-                user.save(conn).await?;
+                user.save_if_current(&expected_user, conn).await?;
             }
 
             if user.email != user_infos.email {
@@ -467,10 +468,11 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             if resend_limit == 0 || user.login_verify_count < resend_limit {
                 // We want to send another email verification if we require signups to verify
                 // their email address, and we haven't sent them a reminder in a while...
+                let expected_user = user.clone();
                 user.last_verifying_at = Some(now);
                 user.login_verify_count += 1;
 
-                if let Err(e) = user.save(conn).await {
+                if let Err(e) = user.save_if_current(&expected_user, conn).await {
                     error!("Error updating user: {e:#?}");
                 }
 
@@ -626,7 +628,7 @@ async fn webauthn_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
 
 async fn authenticated_response(
     user: &User,
-    device: &mut Device,
+    device: &mut LoginDevice,
     auth_tokens: auth::AuthTokens,
     twofactor_token: Option<String>,
     conn: &DbConn,
@@ -653,8 +655,8 @@ async fn authenticated_response(
         register_push_device(device, conn).await?;
     }
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Publish only after slow external work, under the account/revocation lock.
+    device.publish(user, conn).await?;
 
     let master_password_policy = identity_master_password_policy(user, conn).await;
 
@@ -810,8 +812,8 @@ async fn user_api_key_login(
     // let orgs = Membership::find_confirmed_by_user(&user.uuid, conn).await;
     let access_claims = auth::LoginJwtClaims::default(&device, &user, &AuthMethod::UserApiKey, data.client_id);
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // API-key grants obey the same final account/session publication guard.
+    device.publish(&user, conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
 
@@ -901,8 +903,32 @@ async fn organization_api_key_login(data: ConnectData, conn: &DbConn, ip: &Clien
     })))
 }
 
-/// Retrieves an existing device or creates a new device from ConnectData and the User
-async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult<Device> {
+struct LoginDevice {
+    device: Device,
+    // None means this request created an unpersisted device, not a missing old
+    // session. An existing device's original token must still match at commit.
+    expected_token: Option<String>,
+}
+
+impl std::ops::Deref for LoginDevice {
+    type Target = Device;
+    fn deref(&self) -> &Device {
+        &self.device
+    }
+}
+impl std::ops::DerefMut for LoginDevice {
+    fn deref_mut(&mut self) -> &mut Device {
+        &mut self.device
+    }
+}
+impl LoginDevice {
+    async fn publish(&mut self, user: &User, conn: &DbConn) -> EmptyResult {
+        self.device.save_for_login(user, self.expected_token.as_deref(), conn).await
+    }
+}
+
+/// Load a device without publishing a new session before authentication finishes.
+async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult<LoginDevice> {
     // On iOS, device_type sends "iOS", on others it sends a number
     // When unknown or unable to parse, return 14, which is 'Unknown Browser'
     let device_type = util::try_parse_string(data.device_type.as_ref()).unwrap_or(14);
@@ -911,12 +937,17 @@ async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult
 
     // Find device or create new
     if let Some(device) = Device::find_by_uuid_and_user(&device_id, &user.uuid, conn).await {
-        Ok(device)
+        let expected_token = Some(device.refresh_token.clone());
+        Ok(LoginDevice {
+            device,
+            expected_token,
+        })
     } else {
-        let mut device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
-        // save device without updating `device.updated_at`
-        device.save(false, conn).await?;
-        Ok(device)
+        let device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
+        Ok(LoginDevice {
+            device,
+            expected_token: None,
+        })
     }
 }
 
@@ -1039,8 +1070,9 @@ async fn twofactor_auth(
             }
 
             // Remove the recovery code, not needed without twofactors
+            let expected_user = user.clone();
             user.totp_recover = None;
-            user.save(conn).await?;
+            user.save_if_current(&expected_user, conn).await?;
         }
         _ => err!(
             "Invalid two factor provider",

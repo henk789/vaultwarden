@@ -7,13 +7,16 @@ use serde_json::Value;
 use crate::{
     api::{ApiResult, EmptyResult},
     crypto,
-    db::{DbConn, schema::devices},
+    db::{
+        DbConn, DbConnInner,
+        schema::{devices, users},
+    },
     error::{Error, MapResult},
     util::{format_date, get_uuid},
 };
 use macros::{IdFromParam, UuidFromParam};
 
-use super::{AuthRequest, UserId};
+use super::{AuthRequest, User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = devices)]
@@ -145,30 +148,86 @@ impl Device {
             self.updated_at = Utc::now().naive_utc();
         }
 
-        db_run! { conn:
-            mysql {
-                crate::util::retry(||
-                    diesel::insert_into(devices::table)
-                        .values(&*self)
-                        .on_conflict(diesel::dsl::DuplicatedKeys)
-                        .do_update()
-                        .set(&*self)
-                        .execute(conn),
-                    10,
-                ).map_res("Error saving device")
-            }
-            postgresql, sqlite {
-                crate::util::retry(||
-                    diesel::insert_into(devices::table)
-                        .values(&*self)
-                        .on_conflict((devices::uuid, devices::user_uuid))
-                        .do_update()
-                        .set(&*self)
-                        .execute(conn),
-                    10,
-                ).map_res("Error saving device")
-            }
+        // Ordinary device updates may not recreate a deleted device or replay a
+        // refresh token that a revocation transaction has already replaced.
+        conn.run(|conn| {
+            conn.transaction::<_, Error, _>(|conn| {
+                let target = || {
+                    devices::table
+                        .filter(devices::uuid.eq(&self.uuid))
+                        .filter(devices::user_uuid.eq(&self.user_uuid))
+                        .filter(devices::refresh_token.eq(&self.refresh_token))
+                };
+                diesel::update(target()).set(&*self).execute(conn).map(|_| ()).map_res("Error saving device")?;
+                if !self.refresh_token_is_current_locked(&self.refresh_token, conn)? {
+                    return Err(Error::new_msg("Session changed. Please log in again."));
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    fn refresh_token_is_current_locked(&self, token: &str, conn: &mut DbConnInner) -> ApiResult<bool> {
+        let query = devices::table
+            .filter(devices::uuid.eq(&self.uuid))
+            .filter(devices::user_uuid.eq(&self.user_uuid))
+            .filter(devices::refresh_token.eq(token))
+            .select(devices::uuid);
+        match conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(conn) => query.for_update().first::<DeviceId>(conn).optional(),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(conn) => query.for_update().first::<DeviceId>(conn).optional(),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(conn) => query.first::<DeviceId>(conn).optional(),
         }
+        .map(|row| row.is_some())
+        .map_res("Error checking session device")
+    }
+
+    pub async fn save_for_login(&mut self, user: &User, expected_token: Option<&str>, conn: &DbConn) -> EmptyResult {
+        if self.user_uuid != user.uuid {
+            err!("Invalid login account")
+        }
+        conn.run(|conn| {
+            conn.transaction::<_, Error, _>(|conn| {
+                user.lock_authentication_epoch(conn)?;
+                self.updated_at = Utc::now().naive_utc();
+                if let Some(token) = expected_token {
+                    let target = devices::table
+                        .filter(devices::uuid.eq(&self.uuid))
+                        .filter(devices::user_uuid.eq(&user.uuid))
+                        .filter(devices::refresh_token.eq(token));
+                    if !self.refresh_token_is_current_locked(token, conn)? {
+                        return Err(Error::new_msg("Session changed. Please log in again."));
+                    }
+                    diesel::update(target).set(&*self).execute(conn).map(|_| ()).map_res("Error saving login device")
+                } else {
+                    diesel::insert_into(devices::table)
+                        .values(&*self)
+                        .execute(conn)
+                        .map(|_| ())
+                        .map_res("Error creating login device")
+                }
+            })
+        })
+        .await
+    }
+
+    pub async fn session_is_current(device: &DeviceId, user: &UserId, stamp: &str, conn: &DbConn) -> bool {
+        conn.run(move |conn| {
+            devices::table
+                .inner_join(users::table.on(users::uuid.eq(devices::user_uuid)))
+                .filter(devices::uuid.eq(device))
+                .filter(users::uuid.eq(user))
+                .filter(users::enabled.eq(true))
+                .filter(users::security_stamp.eq(stamp))
+                .count()
+                .get_result::<i64>(conn)
+                .is_ok_and(|count| count == 1)
+        })
+        .await
     }
 
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -289,18 +348,6 @@ impl Device {
                 != 0
         })
         .await
-    }
-
-    pub async fn rotate_refresh_tokens_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
-        // Generate a new token per device.
-        // We cannot do a single UPDATE with one value because each device needs a unique token.
-        let devices = Self::find_by_user(user_uuid, conn).await;
-        for mut device in devices {
-            device.refresh_token = Device::generate_refresh_token();
-            device.twofactor_remember = None;
-            device.save(false, conn).await?;
-        }
-        Ok(())
     }
 
     pub async fn clear_twofactor_remember_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {

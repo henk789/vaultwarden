@@ -1,13 +1,13 @@
 // Native credential/keyset contract informed by Vaultwarden PR 7297 (AGPL-3.0),
 // branch snapshot at 727fead3a06eabf477ae9abed2ff0328acba7a6f.
 // Transactional lifecycle guards keep vault key rotation and passkey keys consistent.
-use super::{Device, DeviceId, TwoFactor, User, UserId};
+use super::{TwoFactor, User, UserId};
 use crate::{
     api::{ApiResult, EmptyResult},
     crypto,
     db::{
         DbConn, DbConnInner,
-        schema::{devices, twofactor, users, web_authn_credentials, web_authn_login_challenges},
+        schema::{twofactor, users, web_authn_credentials, web_authn_login_challenges},
     },
     error::Error,
     util::get_uuid,
@@ -59,15 +59,11 @@ impl PasskeyAccount {
             .set(users::uuid.eq(&self.uuid))
             .execute(conn)
             .map_err(|_| unavailable())?;
-        let count = users::table
-            .filter(users::uuid.eq(&self.uuid))
-            .filter(users::enabled.eq(true))
-            .filter(users::security_stamp.eq(&self.stamp))
-            .filter(users::private_key.eq(&self.private_key))
-            .count()
-            .get_result::<i64>(conn)
-            .map_err(|_| unavailable())?;
-        if count != 1 {
+        let current = User::find_by_uuid_locked(&self.uuid, conn).map_err(|_| unavailable())?;
+        if !current.enabled
+            || current.security_stamp != self.stamp
+            || current.private_key.as_deref() != Some(self.private_key.as_str())
+        {
             return Err(Error::new_msg("Account changed. Sync and try again."));
         }
         Ok(())
@@ -305,8 +301,7 @@ impl WebAuthnCredential {
                     .set(users::uuid.eq(&expected.0))
                     .execute(conn)
                     .map_err(|_| unavailable())?;
-                let mut current =
-                    users::table.filter(users::uuid.eq(&expected.0)).first::<User>(conn).map_err(|_| unavailable())?;
+                let mut current = User::find_by_uuid_locked(&expected.0, conn).map_err(|_| unavailable())?;
                 if !current.enabled
                     || current.security_stamp != expected.1
                     || current.password_hash != expected.2
@@ -341,22 +336,7 @@ impl WebAuthnCredential {
 
                 // Keep push registration metadata for post-commit notification.
                 // Only token fields change; do not replay stale device snapshots.
-                let ids = devices::table
-                    .filter(devices::user_uuid.eq(&current.uuid))
-                    .select(devices::uuid)
-                    .load::<DeviceId>(conn)
-                    .map_err(|_| unavailable())?;
-                for id in ids {
-                    diesel::update(
-                        devices::table.filter(devices::user_uuid.eq(&current.uuid)).filter(devices::uuid.eq(id)),
-                    )
-                    .set((
-                        devices::refresh_token.eq(Device::generate_refresh_token()),
-                        devices::twofactor_remember.eq::<Option<String>>(None),
-                    ))
-                    .execute(conn)
-                    .map_err(|_| unavailable())?;
-                }
+                User::revoke_device_tokens(&current.uuid, conn).map_err(|_| unavailable())?;
                 Ok(Some(current))
             })
         })

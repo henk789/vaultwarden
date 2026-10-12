@@ -23,7 +23,7 @@ use crate::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
             EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
             MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType,
+            UserKdfType, UserProfileUpdate,
         },
     },
     mail,
@@ -348,7 +348,9 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     let password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(password_hint.as_ref())?;
 
-    let mut user = match User::find_by_mail(&email, &conn).await {
+    let existing_user = User::find_by_mail(&email, &conn).await;
+    let expected_user = existing_user.clone();
+    let mut user = match existing_user {
         Some(user) => {
             if !user.password_hash.is_empty() {
                 err!("Registration not allowed or user already exists")
@@ -427,7 +429,11 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
         }
     }
 
-    user.save(&conn).await?;
+    if let Some(expected) = expected_user {
+        user.save_if_current(&expected, &conn).await?;
+    } else {
+        user.save(&conn).await?;
+    }
 
     // accept any open emergency access invitations
     if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
@@ -445,6 +451,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
 async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: SetPasswordData = data.into_inner();
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     if user.private_key.is_some() || !user.password_hash.is_empty() {
         err!("Account already initialized, cannot set password")
@@ -495,7 +502,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
-    user.save(&conn).await?;
+    user.save_if_current(&expected_user, &conn).await?;
 
     Ok(Json(json!({
       "object": "set-password",
@@ -529,10 +536,7 @@ async fn post_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) -
         err!("The field Name must be a string with a maximum length of 50.");
     }
 
-    let mut user = headers.user;
-    user.name = data.name;
-
-    user.save(&conn).await?;
+    let user = headers.user.update_profile(UserProfileUpdate::Name(data.name), &conn).await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
@@ -555,10 +559,7 @@ async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> J
         err!("The field AvatarColor must be a HTML/Hex color code with a length of 7 characters")
     }
 
-    let mut user = headers.user;
-    user.avatar_color = data.avatar_color;
-
-    user.save(&conn).await?;
+    let user = headers.user.update_profile(UserProfileUpdate::Avatar(data.avatar_color), &conn).await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
@@ -655,6 +656,7 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
         };
 
     let mut user = user;
+    let expected_user = user.clone();
 
     user.password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(user.password_hint.as_ref())?;
@@ -673,14 +675,14 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     )
     .await?;
 
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
     nt.send_logout(&user, Some(&headers.device), &conn).await;
 
-    save_result
+    Ok(())
 }
 
 fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
@@ -770,6 +772,7 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
     data.authentication_data.check(&headers.user, &data.unlock_data)?;
 
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     set_kdf_data(&mut user, &data.unlock_data.kdf)?;
 
@@ -781,11 +784,11 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
         &conn,
     )
     .await?;
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, Some(&headers.device), &conn).await;
 
-    save_result
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1054,6 +1057,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
 
         // Update user data
         let mut user = headers.user;
+        let expected_user = user.clone();
 
         user.private_key = Some(data.account_keys.user_key_encrypted_account_private_key);
         user.set_password(
@@ -1065,7 +1069,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         )
         .await?;
 
-        let save_result = user.save(&conn).await;
+        let save_result = user.save_if_current(&expected_user, &conn).await;
         let save_result = match save_result {
             Ok(()) if !passkey_rewraps.is_empty() => {
                 // Old PRF rows are no longer exposed once the encrypted account private
@@ -1102,12 +1106,13 @@ struct KeyIdData {
 #[post("/accounts/key-management/user-key-id", data = "<data>")]
 async fn post_user_key(data: Json<KeyIdData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let mut user = headers.user;
+    let expected_user = user.clone();
     if user.key_id.is_some() {
         err_code!("Unexpected data", Status::UnprocessableEntity.code);
     }
 
     user.key_id = Some(data.into_inner().user_key_id);
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[post("/accounts/security-stamp", data = "<data>")]
@@ -1117,14 +1122,13 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&user, true, &conn).await?;
 
+    let expected_user = user.clone();
     user.reset_security_stamp(&conn).await?;
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
-
-    save_result
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1180,9 +1184,10 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
         debug!("Email change request for user ({}) to email ({}) with token ({token})", user.uuid, data.new_email);
     }
 
+    let expected_user = user.clone();
     user.email_new = Some(data.new_email);
     user.email_new_token = Some(token);
-    user.save(&conn).await
+    user.save_if_current(&expected_user, &conn).await
 }
 
 #[derive(Deserialize)]
@@ -1204,6 +1209,7 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     let data: ChangeEmailData = data.into_inner();
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     if !user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password")
@@ -1241,11 +1247,11 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     user.set_password(&data.new_master_password_hash, Some(data.key), true, None, &conn).await?;
 
-    let save_result = user.save(&conn).await;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 
-    save_result
+    Ok(())
 }
 
 #[post("/accounts/verify-email")]
@@ -1284,10 +1290,11 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     if claims.sub != *user.uuid {
         err!("Invalid claim");
     }
+    let expected_user = user.clone();
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn).await {
+    if let Err(e) = user.save_if_current(&expected_user, &conn).await {
         error!("Error saving email verification: {e:#?}");
     }
 
@@ -1478,12 +1485,11 @@ struct SecretVerificationRequest {
 // Change the KDF Iterations if necessary
 pub async fn kdf_upgrade(user: &mut User, pwd_hash: &str, conn: &DbConn) -> ApiResult<()> {
     if user.password_iterations < CONFIG.password_iterations() {
+        let expected_user = user.clone();
         user.password_iterations = CONFIG.password_iterations();
         user.set_password(pwd_hash, None, false, None, conn).await?;
 
-        if let Err(e) = user.save(conn).await {
-            error!("Error updating user: {e:#?}");
-        }
+        user.save_if_current(&expected_user, conn).await?;
     }
     Ok(())
 }
@@ -1509,8 +1515,9 @@ async fn update_api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: He
     data.validate(&user, true, &conn).await?;
 
     if rotate || user.api_key.is_none() {
+        let expected_user = user.clone();
         user.api_key = Some(crypto::generate_api_key());
-        user.save(&conn).await.expect("Error saving API key");
+        user.save_if_current(&expected_user, &conn).await?;
     }
 
     Ok(Json(json!({

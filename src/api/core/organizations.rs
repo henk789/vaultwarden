@@ -2868,6 +2868,7 @@ async fn recover_account(
         None
     };
 
+    let expected_user = user.clone();
     // Sending email first ensure working email configuration and the resulting user notification.
     // Also this might add some protection against security flaws and misuse
     if let Err(e) = mail::send_admin_account_recovery(
@@ -2896,7 +2897,7 @@ async fn recover_account(
         }
     }
 
-    user.save(&conn).await?;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_logout(&user, None, &conn).await;
 

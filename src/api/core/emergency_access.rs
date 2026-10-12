@@ -678,9 +678,10 @@ async fn password_emergency_access(
             err!("Invalid request!")
         };
 
+    let expected_user = grantor_user.clone();
     // change grantor_user password
     grantor_user.set_password(&new_master_password_hash, Some(new_key), true, None, &conn).await?;
-    grantor_user.save(&conn).await?;
+    grantor_user.save_if_current(&expected_user, &conn).await?;
 
     // Disable TwoFactor providers since they will otherwise block logins
     TwoFactor::delete_all_by_user(&grantor_user.uuid, &conn).await?;

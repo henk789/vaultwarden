@@ -5,12 +5,12 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     crypto,
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         models::DeviceId,
-        schema::{invitations, sso_users, twofactor_incomplete, users},
+        schema::{devices, invitations, sso_users, twofactor_incomplete, users},
     },
     error::{Error, MapResult},
     sso::OIDCIdentifier,
@@ -23,7 +23,7 @@ use super::{
     TwoFactorIncomplete,
 };
 
-#[derive(Identifiable, Queryable, Insertable, AsChangeset, Selectable)]
+#[derive(Clone, PartialEq, Identifiable, Queryable, Insertable, AsChangeset, Selectable)]
 #[diesel(table_name = users)]
 #[diesel(treat_none_as_null = true)]
 #[diesel(primary_key(uuid))]
@@ -105,6 +105,11 @@ pub struct UserStampException {
     pub routes: Vec<String>,
     pub security_stamp: String,
     pub expire: i64,
+}
+
+pub enum UserProfileUpdate {
+    Name(String),
+    Avatar(Option<String>),
 }
 
 /// Local methods
@@ -209,9 +214,12 @@ impl User {
         self.password_hash =
             crypto::hash_password(password.as_bytes(), &self.salt, self.password_iterations.cast_unsigned());
 
-        if let Some(route) = allow_next_route {
+        let stamp_exception = if let Some(route) = allow_next_route {
             self.set_stamp_exception(route);
-        }
+            self.stamp_exception.clone()
+        } else {
+            None
+        };
 
         if let Some(new_key) = new_key {
             self.akey = new_key;
@@ -219,14 +227,16 @@ impl User {
 
         if reset_security_stamp {
             self.reset_security_stamp(conn).await?;
+            self.stamp_exception = stamp_exception;
         }
         Ok(())
     }
 
-    pub async fn reset_security_stamp(&mut self, conn: &DbConn) -> EmptyResult {
+    pub fn reset_security_stamp(&mut self, _conn: &DbConn) -> std::future::Ready<EmptyResult> {
+        // Device-token revocation is committed with the guarded user save.
         self.security_stamp = get_uuid();
-        Device::rotate_refresh_tokens_by_user(&self.uuid, conn).await?;
-        Ok(())
+        self.reset_stamp_exception();
+        std::future::ready(Ok(()))
     }
 
     /// Set the stamp_exception to only allow a subsequent request matching a specific route using the current security-stamp.
@@ -338,28 +348,176 @@ impl User {
             err!(format!("User email {} is not a valid email address", self.email.escape_debug()))
         }
 
+        // Creation only: a previously loaded/deleted account must never be
+        // recreated by an upsert. Existing accounts use save_if_current.
         self.updated_at = Utc::now().naive_utc();
+        let saved = conn
+            .run(|conn| {
+                conn.transaction::<_, Error, _>(|conn| {
+                    diesel::insert_into(users::table)
+                        .values(&*self)
+                        .execute(conn)
+                        .map(|_| ())
+                        .map_res("Error creating user")?;
+                    users::table
+                        .filter(users::uuid.eq(&self.uuid))
+                        .first::<Self>(conn)
+                        .map_res("Error loading created user")
+                })
+            })
+            .await?;
+        *self = saved;
+        Ok(())
+    }
 
-        db_run! { conn:
-            mysql {
-                diesel::insert_into(users::table)
-                    .values(&*self)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving user")
-            }
-            postgresql, sqlite {
-                diesel::insert_into(users::table) // Insert or update
-                    .values(&*self)
-                    .on_conflict(users::uuid)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving user")
-            }
+    /// Guard a whole-user write with its original database snapshot. Ignore only
+    /// the revision timestamp, which cipher operations legitimately advance.
+    /// This uses existing account data, not a new schema/version mechanism.
+    pub async fn save_if_current(&mut self, expected: &Self, conn: &DbConn) -> EmptyResult {
+        if self.uuid != expected.uuid || !crate::util::is_valid_email(&self.email) {
+            err!("Invalid account update")
         }
+        let saved = conn
+            .run(|conn| {
+                conn.transaction::<_, Error, _>(|conn| {
+                    diesel::update(users::table.filter(users::uuid.eq(&expected.uuid)))
+                        .set(users::uuid.eq(&expected.uuid))
+                        .execute(conn)
+                        .map(|_| ())
+                        .map_res("Error locking user")?;
+                    let mut current = Self::find_by_uuid_locked(&expected.uuid, conn)?;
+                    current.updated_at = expected.updated_at;
+                    if &current != expected {
+                        return Err(Error::new_msg("Account changed. Sync and try again."));
+                    }
+                    if current.security_stamp != self.security_stamp {
+                        Self::revoke_device_tokens(&self.uuid, conn)?;
+                    }
+                    self.updated_at = Utc::now().naive_utc();
+                    diesel::update(users::table.filter(users::uuid.eq(&self.uuid)))
+                        .set(&*self)
+                        .execute(conn)
+                        .map(|_| ())
+                        .map_res("Error saving user")?;
+                    users::table
+                        .filter(users::uuid.eq(&self.uuid))
+                        .first::<Self>(conn)
+                        .map_res("Error loading updated user")
+                })
+            })
+            .await?;
+        *self = saved;
+        Ok(())
+    }
+
+    pub(crate) fn find_by_uuid_locked(uuid: &UserId, conn: &mut DbConnInner) -> ApiResult<Self> {
+        let query = users::table.filter(users::uuid.eq(uuid));
+        // MySQL locking reads see current committed rows even when an enclosing
+        // key-rotation transaction has already established a repeatable-read view.
+        match conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(conn) => query.for_update().first::<Self>(conn),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(conn) => query.for_update().first::<Self>(conn),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(conn) => query.first::<Self>(conn),
+        }
+        .map_res("Error loading locked account")
+    }
+
+    pub(crate) fn revoke_device_tokens(user_uuid: &UserId, conn: &mut DbConnInner) -> EmptyResult {
+        let query = devices::table.filter(devices::user_uuid.eq(user_uuid)).select(devices::uuid);
+        let ids = match &mut *conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(conn) => query.for_update().load::<DeviceId>(conn),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(conn) => query.for_update().load::<DeviceId>(conn),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(conn) => query.load::<DeviceId>(conn),
+        }
+        .map_res("Error loading session devices")?;
+        for id in ids {
+            diesel::update(devices::table.filter(devices::user_uuid.eq(user_uuid)).filter(devices::uuid.eq(id)))
+                .set((
+                    devices::refresh_token.eq(Device::generate_refresh_token()),
+                    devices::twofactor_remember.eq::<Option<String>>(None),
+                ))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error revoking sessions")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn same_authentication_epoch(&self, current: &Self) -> bool {
+        current.enabled
+            && self.uuid == current.uuid
+            && self.security_stamp == current.security_stamp
+            && self.password_hash == current.password_hash
+            && self.salt == current.salt
+            && self.password_iterations == current.password_iterations
+            && self.api_key == current.api_key
+            && self.totp_recover == current.totp_recover
+            && self.email == current.email
+            && self.verified_at == current.verified_at
+            && self.akey == current.akey
+            && self.private_key == current.private_key
+            && self.public_key == current.public_key
+            && self.key_id == current.key_id
+            && self.client_kdf_type == current.client_kdf_type
+            && self.client_kdf_iter == current.client_kdf_iter
+            && self.client_kdf_memory == current.client_kdf_memory
+            && self.client_kdf_parallelism == current.client_kdf_parallelism
+    }
+
+    pub(crate) fn lock_authentication_epoch(&self, conn: &mut DbConnInner) -> EmptyResult {
+        diesel::update(users::table.filter(users::uuid.eq(&self.uuid)))
+            .set(users::uuid.eq(&self.uuid))
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error locking account")?;
+        let current = Self::find_by_uuid_locked(&self.uuid, conn)?;
+        if !self.same_authentication_epoch(&current) {
+            return Err(Error::new_msg("Account changed. Please log in again."));
+        }
+        Ok(())
+    }
+
+    pub async fn update_profile(&self, update: UserProfileUpdate, conn: &DbConn) -> ApiResult<Self> {
+        conn.run(move |conn| {
+            conn.transaction::<_, Error, _>(|conn| {
+                self.lock_authentication_epoch(conn)?;
+                let updated_at = Utc::now().naive_utc();
+                let target = users::table.filter(users::uuid.eq(&self.uuid));
+                match update {
+                    UserProfileUpdate::Name(name) => diesel::update(target)
+                        .set((users::name.eq(name), users::updated_at.eq(updated_at)))
+                        .execute(conn),
+                    UserProfileUpdate::Avatar(color) => diesel::update(target)
+                        .set((users::avatar_color.eq(color), users::updated_at.eq(updated_at)))
+                        .execute(conn),
+                }
+                .map(|_| ())
+                .map_res("Error updating profile")?;
+                users::table.filter(users::uuid.eq(&self.uuid)).first::<Self>(conn).map_res("Error loading profile")
+            })
+        })
+        .await
+    }
+
+    pub async fn clear_expired_stamp_exception(&self, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            diesel::update(
+                users::table
+                    .filter(users::uuid.eq(&self.uuid))
+                    .filter(users::stamp_exception.eq(&self.stamp_exception)),
+            )
+            .set(users::stamp_exception.eq::<Option<String>>(None))
+            .execute(conn)
+            .map(|_| ())
+            .map_res("Error clearing stamp exception")
+        })
+        .await
     }
 
     /// Update only the asymmetric pair, without replaying unrelated fields from
@@ -624,6 +782,9 @@ pub struct UserId(String);
 #[deref(forward)]
 #[from(forward)]
 pub struct KeyId(String);
+
+#[cfg(all(test, mysql))]
+mod mysql_tests;
 
 impl SsoUser {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {

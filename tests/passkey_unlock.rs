@@ -105,6 +105,9 @@ impl Fixture {
         Self::with_policy(enabled, true).await
     }
     async fn with_policy(enabled: bool, sso_only: bool) -> Self {
+        Self::with_mail_policy(enabled, sso_only, None).await
+    }
+    async fn with_mail_policy(enabled: bool, sso_only: bool, smtp_port: Option<u16>) -> Self {
         static CRYPTO: std::sync::Once = std::sync::Once::new();
         CRYPTO.call_once(|| rustls::crypto::ring::default_provider().install_default().unwrap());
         let id = || uuid::Uuid::new_v4().to_string();
@@ -135,13 +138,14 @@ impl Fixture {
             .env("ROCKET_ADDRESS", "127.0.0.1")
             .env("ROCKET_PORT", "0")
             .env("WEB_VAULT_ENABLED", "false")
-            .env("ENABLE_WEBSOCKET", "false")
+            .env("ENABLE_WEBSOCKET", "true")
             .env("PUSH_ENABLED", "false")
             .env("DISABLE_ICON_DOWNLOAD", "true")
             .env("JOB_POLL_INTERVAL_MS", "0")
             .env("LOGIN_RATELIMIT_MAX_BURST", "100")
             .env("DATABASE_MAX_CONNS", "4")
             .env("DATABASE_MIN_CONNS", "1")
+            .env("PASSWORD_ITERATIONS", "100000")
             .env("PASSKEYS_ENABLED", enabled.to_string())
             .env("SSO_ENABLED", sso_only.to_string())
             .env("SSO_ONLY", sso_only.to_string())
@@ -150,6 +154,17 @@ impl Fixture {
             .env("SSO_AUTHORITY", "http://127.0.0.1:9")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
+        if let Some(port) = smtp_port {
+            command
+                .env("SMTP_HOST", "127.0.0.1")
+                .env("SMTP_PORT", port.to_string())
+                .env("SMTP_SECURITY", "off")
+                .env("SMTP_FROM", "security@example.test")
+                .env("SMTP_TIMEOUT", "15")
+                .env("SMTP_DEBUG", "true")
+                .env("SHOW_PASSWORD_HINT", "false")
+                .env("REQUIRE_DEVICE_EMAIL", "true");
+        }
         for name in ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -207,10 +222,10 @@ impl Fixture {
         }
         let salt = [0u8; 64];
         let mut hash = [0u8; 32];
-        openssl::pkcs5::pbkdf2_hmac(PASSWORD.as_bytes(), &salt, 1000, MessageDigest::sha256(), &mut hash).unwrap();
+        openssl::pkcs5::pbkdf2_hmac(PASSWORD.as_bytes(), &salt, 100_000, MessageDigest::sha256(), &mut hash).unwrap();
         let hash = data_encoding::HEXLOWER.encode(&hash);
         // All interpolated values are generated UUIDs or fixed synthetic fixture values.
-        f.sql(&format!("INSERT INTO users (uuid,enabled,created_at,updated_at,login_verify_count,email,name,password_hash,salt,password_iterations,akey,private_key,security_stamp,equivalent_domains,excluded_globals,client_kdf_type,client_kdf_iter) VALUES ('{}',1,datetime('now'),datetime('now'),0,'user@example.test','Synthetic user',X'{hash}',zeroblob(64),1000,'synthetic-key','synthetic-private-key','synthetic-stamp','[]','[]',0,600000); INSERT INTO devices (uuid,user_uuid,created_at,updated_at,name,atype,refresh_token) VALUES ('{}','{}',datetime('now'),datetime('now'),'Synthetic browser',14,'synthetic-refresh');", f.user,f.device,f.user));
+        f.sql(&format!("INSERT INTO users (uuid,enabled,created_at,updated_at,login_verify_count,email,name,password_hash,salt,password_iterations,akey,private_key,security_stamp,equivalent_domains,excluded_globals,client_kdf_type,client_kdf_iter) VALUES ('{}',1,datetime('now'),datetime('now'),0,'user@example.test','Synthetic user',X'{hash}',zeroblob(64),100000,'synthetic-key','synthetic-private-key','synthetic-stamp','[]','[]',0,600000); INSERT INTO devices (uuid,user_uuid,created_at,updated_at,name,atype,refresh_token) VALUES ('{}','{}',datetime('now'),datetime('now'),'Synthetic browser',14,'synthetic-refresh');", f.user,f.device,f.user));
         f
     }
     fn sql(&self, sql: &str) {
@@ -240,6 +255,13 @@ impl Fixture {
             diesel::sqlite::SqliteConnection::establish(self.path.join("db.sqlite3").to_str().unwrap()).unwrap();
         c.batch_execute("PRAGMA busy_timeout=5000;").unwrap();
         c.batch_execute(sql).unwrap();
+    }
+    fn token_with_lifetime(&self, seconds: i64) -> String {
+        let payload = data_encoding::BASE64URL_NOPAD.decode(self.token.split('.').nth(1).unwrap().as_bytes()).unwrap();
+        let mut claims: Value = serde_json::from_slice(&payload).unwrap();
+        claims["exp"] = json!(chrono::Utc::now().timestamp() + seconds);
+        let key = EncodingKey::from_rsa_pem(&fs::read(self.path.join("rsa.pem")).unwrap()).unwrap();
+        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).unwrap()
     }
     fn count(&self, table: &str) -> i64 {
         #[derive(diesel::QueryableByName)]
@@ -1406,4 +1428,355 @@ async fn native_passkey_without_prf_keeps_master_password_unlock_and_refresh() {
         .await
         .unwrap();
     assert!(refresh["access_token"].as_str().is_some_and(|v| !v.is_empty()));
+}
+
+// A real SMTP exchange pauses grants at the external await immediately before
+// publication. No production sleeps/test hooks or scheduler guesses are needed.
+struct MailGate {
+    port: u16,
+    received: std::sync::Arc<tokio::sync::Semaphore>,
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl MailGate {
+    async fn new() -> Self {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let ready = std::sync::Arc::clone(&received);
+        let resume = std::sync::Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                writer.write_all(b"220 synthetic SMTP\r\n").await.unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    if line.starts_with("EHLO") {
+                        writer.write_all(b"250-synthetic\r\n250 PIPELINING\r\n").await.unwrap();
+                    } else if line.starts_with("DATA") {
+                        writer.write_all(b"354 send data\r\n").await.unwrap();
+                        loop {
+                            line.clear();
+                            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                            if line == ".\r\n" {
+                                break;
+                            }
+                        }
+                        ready.add_permits(1);
+                        resume.acquire().await.unwrap().forget();
+                        writer.write_all(b"250 queued\r\n").await.unwrap();
+                    } else if line.starts_with("QUIT") {
+                        writer.write_all(b"221 bye\r\n").await.unwrap();
+                        break;
+                    } else {
+                        writer.write_all(b"250 OK\r\n").await.unwrap();
+                    }
+                }
+            }
+        });
+        Self {
+            port,
+            received,
+            release,
+            task,
+        }
+    }
+    async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.received.acquire()).await.unwrap().unwrap().forget();
+    }
+}
+impl Drop for MailGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn initial_login_cannot_publish_after_revocation_disable_or_password_change() {
+    for (grant, change) in [
+        ("password", "stamp"),
+        ("webauthn", "stamp"),
+        ("client_credentials", "stamp"),
+        ("client_credentials", "api-key"),
+        ("password", "disable"),
+        ("password", "password"),
+    ] {
+        let mail = MailGate::new().await;
+        let f = Fixture::with_mail_policy(true, false, Some(mail.port)).await;
+        let new_device = uuid::Uuid::new_v4().to_string();
+        let request = if grant == "webauthn" {
+            let (registration, key) = registration_with_key(&f.options().await, ORIGIN, true);
+            let credential = registration["deviceResponse"]["rawId"].as_str().unwrap().to_owned();
+            assert_eq!(f.post("/api/webauthn", registration).await.status(), StatusCode::OK);
+            let options: Value = f
+                .client
+                .get(format!("{}/identity/accounts/webauthn/assertion-options", f.url))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let response = native_assertion(&options, &credential, &key, &f.user, ORIGIN, true).to_string();
+            f.client.post(format!("{}/identity/connect/token", f.url)).form(&[
+                ("grant_type", "webauthn"),
+                ("scope", "api offline_access"),
+                ("client_id", "web"),
+                ("token", options["token"].as_str().unwrap()),
+                ("deviceResponse", response.as_str()),
+                ("deviceIdentifier", new_device.as_str()),
+                ("deviceName", "Synthetic new device"),
+                ("deviceType", "14"),
+            ])
+        } else if grant == "client_credentials" {
+            f.sql("UPDATE users SET api_key='synthetic-api-key';");
+            f.client.post(format!("{}/identity/connect/token", f.url)).form(&[
+                ("grant_type", grant),
+                ("scope", "api"),
+                ("client_id", format!("user.{}", f.user).as_str()),
+                ("client_secret", "synthetic-api-key"),
+                ("deviceIdentifier", new_device.as_str()),
+                ("deviceName", "Synthetic new device"),
+                ("deviceType", "14"),
+            ])
+        } else {
+            f.client.post(format!("{}/identity/connect/token", f.url)).form(&[
+                ("grant_type", "password"),
+                ("scope", "api offline_access"),
+                ("client_id", "web"),
+                ("username", "user@example.test"),
+                ("password", PASSWORD),
+                ("deviceIdentifier", new_device.as_str()),
+                ("deviceName", "Synthetic new device"),
+                ("deviceType", "14"),
+            ])
+        };
+        let login = tokio::spawn(async move { request.send().await.unwrap() });
+        mail.wait().await;
+        assert!(!login.is_finished());
+        assert_eq!(f.count("devices"), 1, "a pending grant published a device prematurely");
+        match change {
+            "stamp" => {
+                assert_eq!(
+                    f.post("/api/accounts/security-stamp", json!({"masterPasswordHash":PASSWORD})).await.status(),
+                    StatusCode::OK
+                );
+                assert_eq!(f.count("devices WHERE refresh_token='synthetic-refresh'"), 0);
+            }
+            "disable" => f.sql("UPDATE users SET enabled=FALSE;"),
+            "api-key" => f.sql("UPDATE users SET api_key='rotated-api-key';"),
+            _ => f.sql("UPDATE users SET password_hash=X'010203';"),
+        }
+        mail.release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(5), login).await.unwrap().unwrap();
+        assert!(result.status().is_client_error(), "{grant}/{change}: {}", result.status());
+        assert_eq!(f.count(&format!("devices WHERE uuid='{new_device}'")), 0);
+    }
+}
+
+#[tokio::test]
+async fn disabled_account_is_rejected_by_http_and_refresh_without_rotating_its_token() {
+    let f = Fixture::new(true).await;
+    f.sql("UPDATE users SET enabled=FALSE;");
+    let profile = f.client.get(format!("{}/api/accounts/profile", f.url)).bearer_auth(&f.token).send().await.unwrap();
+    assert_eq!(profile.status(), StatusCode::UNAUTHORIZED);
+    let refresh = f
+        .client
+        .post(format!("{}/identity/connect/token", f.url))
+        .form(&[("grant_type", "refresh_token"), ("client_id", "web"), ("refresh_token", "synthetic-refresh")])
+        .send()
+        .await
+        .unwrap();
+    assert!(refresh.status().is_client_error());
+    assert_eq!(f.count("devices WHERE refresh_token='synthetic-refresh'"), 1);
+}
+
+type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+async fn socket(f: &Fixture, token: &str) -> Result<TestSocket, tokio_tungstenite::tungstenite::Error> {
+    tokio_tungstenite::connect_async(format!(
+        "{}/notifications/hub?access_token={token}",
+        f.url.replace("http://", "ws://")
+    ))
+    .await
+    .map(|(socket, _)| socket)
+}
+async fn assert_socket_closed(mut ws: TestSocket) {
+    use rocket::futures::StreamExt;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+                Some(Ok(_)) => (),
+                Some(Err(e)) => panic!("socket did not close cleanly: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("revoked/expired socket remained open");
+}
+
+#[tokio::test]
+async fn notification_sockets_reject_and_close_revoked_disabled_and_deleted_sessions() {
+    for change in ["stamp", "disable", "device"] {
+        let f = Fixture::new(true).await;
+        let ws = socket(&f, &f.token).await.unwrap();
+        match change {
+            "stamp" => assert_eq!(
+                f.post("/api/accounts/security-stamp", json!({"masterPasswordHash":PASSWORD})).await.status(),
+                StatusCode::OK
+            ),
+            "disable" => f.sql("UPDATE users SET enabled=FALSE;"),
+            _ => f.sql("DELETE FROM devices;"),
+        }
+        assert_socket_closed(ws).await;
+        match socket(&f, &f.token).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status().as_u16(), 401),
+            _ => panic!("invalid session was accepted by the notification hub"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn notification_socket_closes_at_token_expiry_and_expired_handshake_is_rejected() {
+    let f = Fixture::new(true).await;
+    let token = f.token_with_lifetime(2);
+    assert_socket_closed(socket(&f, &token).await.unwrap()).await;
+    match socket(&f, &token).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status().as_u16(), 401),
+        _ => panic!("expired session was accepted by the notification hub"),
+    }
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
+async fn notification_postgres_stalled_database_cannot_hold_an_expiring_socket_open() {
+    let f = Fixture::new(true).await;
+    let token = f.token_with_lifetime(2);
+    let ws = socket(&f, &token).await.unwrap();
+    let (_, url) = f.postgres.as_ref().expect("disposable PostgreSQL gate required");
+    let mut control = diesel::pg::PgConnection::establish(url).unwrap();
+    control.batch_execute("BEGIN; LOCK TABLE users IN ACCESS EXCLUSIVE MODE;").unwrap();
+    f.wait_for_database_wait("pg_stat_activity WHERE datname=current_database() AND wait_event='relation'").await;
+    // A real native query is blocked. The socket must still close, failing
+    // closed on the validation deadline rather than waiting for storage.
+    assert_socket_closed(ws).await;
+    control.batch_execute("COMMIT;").unwrap();
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
+async fn account_postgres_stale_profile_avatar_settings_and_api_key_writes_cannot_undo_security_changes() {
+    for path in
+        ["/api/accounts/profile", "/api/accounts/avatar", "/api/settings/domains", "/api/accounts/rotate-api-key"]
+    {
+        let f = Fixture::new(true).await;
+        let (_, url) = f.postgres.as_ref().expect("disposable PostgreSQL gate required");
+        let mut control = diesel::pg::PgConnection::establish(url).unwrap();
+        control.batch_execute("BEGIN;").unwrap();
+        control.batch_execute(&format!("UPDATE users SET enabled=FALSE,security_stamp='revoked-stamp',akey='new-wrapper',api_key='new-api-key',password_hint='new-hint' WHERE uuid='{}';", f.user)).unwrap();
+        let request = if path.ends_with("avatar") {
+            f.client.put(format!("{}{path}", f.url)).json(&json!({"avatarColor":"#112233"}))
+        } else {
+            let data = match path {
+                "/api/accounts/profile" => json!({"name":"stale-name"}),
+                "/api/settings/domains" => json!({"excludedGlobalEquivalentDomains":[],"equivalentDomains":[]}),
+                _ => json!({"masterPasswordHash":PASSWORD}),
+            };
+            f.client.post(format!("{}{path}", f.url)).json(&data)
+        }
+        .bearer_auth(&f.token);
+        let update = tokio::spawn(async move { request.send().await.unwrap() });
+        f.wait_for_database_wait("pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'")
+            .await;
+        assert!(!update.is_finished());
+        control.batch_execute("COMMIT;").unwrap();
+        assert!(update.await.unwrap().status().is_client_error(), "stale write accepted: {path}");
+        assert_eq!(f.count("users WHERE enabled=FALSE AND security_stamp='revoked-stamp' AND akey='new-wrapper' AND api_key='new-api-key' AND password_hint='new-hint' AND name='Synthetic user'"), 1);
+    }
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
+async fn account_postgres_initial_password_and_api_key_grants_cannot_recreate_deleted_devices() {
+    for grant in ["password", "client_credentials"] {
+        let f = Fixture::with_policy(true, false).await;
+        f.sql("UPDATE users SET api_key='synthetic-api-key';");
+        let (_, url) = f.postgres.as_ref().expect("disposable PostgreSQL gate required");
+        let mut control = diesel::pg::PgConnection::establish(url).unwrap();
+        control.batch_execute("BEGIN;").unwrap();
+        control.batch_execute(&format!("UPDATE users SET uuid=uuid WHERE uuid='{}';", f.user)).unwrap();
+        let client_id = if grant == "client_credentials" {
+            format!("user.{}", f.user)
+        } else {
+            "web".to_owned()
+        };
+        let request = f.client.post(format!("{}/identity/connect/token", f.url)).form(&[
+            ("grant_type", grant),
+            (
+                "scope",
+                if grant == "client_credentials" {
+                    "api"
+                } else {
+                    "api offline_access"
+                },
+            ),
+            ("client_id", client_id.as_str()),
+            ("client_secret", "synthetic-api-key"),
+            ("username", "user@example.test"),
+            ("password", PASSWORD),
+            ("deviceIdentifier", f.device.as_str()),
+            ("deviceName", "Synthetic browser"),
+            ("deviceType", "14"),
+        ]);
+        let login = tokio::spawn(async move { request.send().await.unwrap() });
+        f.wait_for_database_wait("pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'")
+            .await;
+        assert!(!login.is_finished());
+        control.batch_execute("DELETE FROM devices; COMMIT;").unwrap();
+        assert!(login.await.unwrap().status().is_client_error(), "deleted session recreated: {grant}");
+        assert_eq!(f.count("devices"), 0);
+    }
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance; see tests/README.md"]
+async fn account_postgres_stale_push_updates_cannot_restore_revoked_tokens_or_deleted_devices() {
+    for change in ["rotate", "delete"] {
+        let f = Fixture::new(true).await;
+        let (_, url) = f.postgres.as_ref().expect("disposable PostgreSQL gate required");
+        let mut control = diesel::pg::PgConnection::establish(url).unwrap();
+        control.batch_execute("BEGIN;").unwrap();
+        if change == "rotate" {
+            control.batch_execute("UPDATE devices SET refresh_token='rotated-token',twofactor_remember=NULL,push_uuid='preserved-push-uuid';").unwrap();
+        } else {
+            control.batch_execute("DELETE FROM devices;").unwrap();
+        }
+        let request = f
+            .client
+            .post(format!("{}/api/devices/identifier/{}/token", f.url, f.device))
+            .bearer_auth(&f.token)
+            .json(&json!({"pushToken":"stale-push-token"}));
+        let update = tokio::spawn(async move { request.send().await.unwrap() });
+        f.wait_for_database_wait("pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'")
+            .await;
+        assert!(!update.is_finished());
+        control.batch_execute("COMMIT;").unwrap();
+        assert!(update.await.unwrap().status().is_client_error());
+        if change == "rotate" {
+            assert_eq!(f.count("devices WHERE refresh_token='rotated-token' AND twofactor_remember IS NULL AND push_uuid='preserved-push-uuid' AND push_token IS NULL"), 1);
+        } else {
+            assert_eq!(f.count("devices"), 0);
+        }
+    }
 }

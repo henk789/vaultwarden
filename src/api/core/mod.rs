@@ -126,11 +126,12 @@ async fn post_settings_domains(
     let equivalent_domains = data.equivalent_domains.unwrap_or_default();
 
     let mut user = headers.user;
+    let expected_user = user.clone();
 
     user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_owned());
     user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_owned());
 
-    user.save(&conn).await?;
+    user.save_if_current(&expected_user, &conn).await?;
 
     nt.send_user_update(UpdateType::SyncSettings, &user, headers.device.push_uuid.as_ref(), &conn).await;
 
